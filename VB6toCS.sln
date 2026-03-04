@@ -1,0 +1,34 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{8647F39B-D69A-42B3-AF12-D3304E67D4A8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VB6toCS.Cli", "src\VB6toCS.Cli\VB6toCS.Cli.csproj", "{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VB6toCS.Core", "src\VB6toCS.Core\VB6toCS.Core.csproj", "{AA038910-3FC2-417B-9D61-955F3AE6972F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AA038910-3FC2-417B-9D61-955F3AE6972F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AA038910-3FC2-417B-9D61-955F3AE6972F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AA038910-3FC2-417B-9D61-955F3AE6972F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AA038910-3FC2-417B-9D61-955F3AE6972F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B2CB5F9C-6E7C-4725-AF50-C344A6FA0D6B} = {8647F39B-D69A-42B3-AF12-D3304E67D4A8}
+		{AA038910-3FC2-417B-9D61-955F3AE6972F} = {8647F39B-D69A-42B3-AF12-D3304E67D4A8}
+	EndGlobalSection
+EndGlobal
