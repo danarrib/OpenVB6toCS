@@ -50,3 +50,19 @@ public sealed record ImplementsNode(
     int Line,
     int Column,
     string InterfaceName) : AstNode(Line, Column);
+
+/// <summary>
+/// VB6 Declare statement — external DLL function (e.g. Win32 API).
+/// Preserved in the AST for reference; code generator will emit a P/Invoke stub
+/// or a // TODO comment.
+/// </summary>
+public sealed record DeclareNode(
+    int Line,
+    int Column,
+    AccessModifier Access,
+    bool IsSub,
+    string Name,
+    string LibName,
+    string? AliasName,
+    IReadOnlyList<ParameterNode> Parameters,
+    TypeRefNode? ReturnType) : AstNode(Line, Column);

@@ -223,8 +223,24 @@ public sealed class Lexer
     private Token ScanComment(int line, int col)
     {
         var sb = new StringBuilder();
-        while (_pos < _src.Length && _src[_pos] != '\r' && _src[_pos] != '\n')
-            sb.Append(Advance());
+        while (true)
+        {
+            // Read to end of line
+            while (_pos < _src.Length && _src[_pos] != '\r' && _src[_pos] != '\n')
+                sb.Append(Advance());
+
+            // VB6 quirk: a comment ending with space+underscore continues on the next line
+            string text = sb.ToString();
+            if (text.Length >= 2 && text[^1] == '_' && text[^2] == ' '
+                && _pos < _src.Length)
+            {
+                // Consume the newline and continue reading as part of this comment
+                if (_src[_pos] == '\r') _pos++;
+                if (_pos < _src.Length && _src[_pos] == '\n') { _pos++; _line++; _col = 1; }
+                continue;
+            }
+            break;
+        }
         return new Token(TokenKind.Comment, sb.ToString(), line, col);
     }
 

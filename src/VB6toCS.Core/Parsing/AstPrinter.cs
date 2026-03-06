@@ -44,6 +44,11 @@ public static class AstPrinter
                 foreach (var dec in d.Declarators) PrintDeclarator(dec, writer, indent + "  ");
                 break;
 
+            case ReDimNode r:
+                writer.WriteLine($"{indent}ReDimNode{(r.IsPreserve ? " [Preserve]" : "")}");
+                foreach (var dec in r.Declarators) PrintDeclarator(dec, writer, indent + "  ");
+                break;
+
             case EnumNode e:
                 writer.WriteLine($"{indent}EnumNode '{e.Name}' [{e.Access}]");
                 foreach (var m in e.Members)
@@ -55,6 +60,13 @@ public static class AstPrinter
                 writer.WriteLine($"{indent}UdtNode '{u.Name}' [{u.Access}]");
                 foreach (var f in u.Fields)
                     writer.WriteLine($"{indent}  UdtFieldNode '{f.Name}' As {f.TypeRef.TypeName}");
+                break;
+
+            case DeclareNode d:
+                var dKind = d.IsSub ? "Sub" : "Function";
+                var dAlias = d.AliasName != null ? $" Alias \"{d.AliasName}\"" : "";
+                var dRet = d.ReturnType != null ? $" As {d.ReturnType.TypeName}" : "";
+                writer.WriteLine($"{indent}DeclareNode [{d.Access}] {dKind} '{d.Name}' Lib \"{d.LibName}\"{dAlias}{dRet}");
                 break;
 
             case SubNode s:
@@ -179,6 +191,10 @@ public static class AstPrinter
 
             case EndStatementNode:
                 writer.WriteLine($"{indent}EndStatementNode");
+                break;
+
+            case ErrorStatementNode e:
+                writer.WriteLine($"{indent}ErrorStatementNode Error {ExprStr(e.ErrorNumber)}");
                 break;
 
             default:

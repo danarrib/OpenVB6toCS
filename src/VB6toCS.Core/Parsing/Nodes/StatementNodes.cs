@@ -9,6 +9,18 @@ public sealed record LocalDimNode(
     bool IsStatic,
     IReadOnlyList<VariableDeclaratorNode> Declarators) : AstNode(Line, Column);
 
+public sealed record ReDimNode(
+    int Line,
+    int Column,
+    bool IsPreserve,
+    IReadOnlyList<VariableDeclaratorNode> Declarators) : AstNode(Line, Column);
+
+/// <summary>VB6 'Error errornumber' statement — raises a runtime error.</summary>
+public sealed record ErrorStatementNode(
+    int Line,
+    int Column,
+    ExpressionNode ErrorNumber) : AstNode(Line, Column);
+
 public sealed record AssignmentNode(
     int Line,
     int Column,

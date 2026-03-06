@@ -215,6 +215,13 @@ public sealed class Parser
         bool isStatic = _ts.Match(TokenKind.KwStatic);
 
         var next = _ts.Peek();
+
+        // Declare Sub/Function — external DLL declaration (e.g. Win32 API)
+        // "Declare" is not a keyword token; it comes through as Identifier("Declare")
+        if (next.Kind == TokenKind.Identifier &&
+            next.Text.Equals("Declare", StringComparison.OrdinalIgnoreCase))
+            return ParseDeclare(start, access);
+
         return next.Kind switch
         {
             TokenKind.KwDim => ParseFieldDeclaration(start, access),
@@ -286,9 +293,35 @@ public sealed class Parser
     private VariableDeclaratorNode ParseVariableDeclarator()
     {
         var nameTok = ExpectIdentifierOrKeyword();
+
+        // Array syntax on the variable name: Dim arr() As String  or  Dim arr(10) As Integer
+        bool nameIsArray = false;
+        if (_ts.Match(TokenKind.LParen))
+        {
+            nameIsArray = true;
+            // Consume optional dimension list
+            int depth = 1;
+            while (depth > 0 && _ts.Peek().Kind != TokenKind.EndOfFile)
+            {
+                var t = _ts.Consume();
+                if (t.Kind == TokenKind.LParen) depth++;
+                else if (t.Kind == TokenKind.RParen) depth--;
+            }
+        }
+
         TypeRefNode? typeRef = null;
         if (_ts.Match(TokenKind.KwAs))
+        {
             typeRef = ParseTypeRef();
+            if (nameIsArray && !typeRef.IsArray)
+                typeRef = typeRef with { IsArray = true, ArrayRank = 1 };
+        }
+        else if (nameIsArray)
+        {
+            // Array with no explicit type — treat as Variant array
+            typeRef = new TypeRefNode("Variant", true, false, 1);
+        }
+
         return new VariableDeclaratorNode(nameTok.Line, nameTok.Column, nameTok.Text, typeRef, null);
     }
 
@@ -387,7 +420,53 @@ public sealed class Parser
         return new ImplementsNode(tok.Line, tok.Column, name.Text);
     }
 
+    // ── Declare ────────────────────────────────────────────────────────────
+
+    private DeclareNode ParseDeclare(Token start, AccessModifier access)
+    {
+        _ts.Consume(); // "Declare" identifier
+
+        bool isSub = _ts.Peek().Kind == TokenKind.KwSub;
+        if (isSub) _ts.Consume();
+        else _ts.Expect(TokenKind.KwFunction);
+
+        var nameTok = ExpectIdentifierOrKeyword();
+
+        // Lib "libname"
+        if (!(_ts.Peek().Kind == TokenKind.Identifier &&
+              _ts.Peek().Text.Equals("Lib", StringComparison.OrdinalIgnoreCase)))
+            throw new ParseException("Expected 'Lib' after Declare name", _ts.Peek().Line, _ts.Peek().Column);
+        _ts.Consume();
+        var libTok = _ts.Expect(TokenKind.StringLiteral);
+        string libName = UnquoteString(libTok.Text);
+
+        // Optional: Alias "aliasname"
+        string? aliasName = null;
+        if (_ts.Peek().Kind == TokenKind.Identifier &&
+            _ts.Peek().Text.Equals("Alias", StringComparison.OrdinalIgnoreCase))
+        {
+            _ts.Consume();
+            var aliasTok = _ts.Expect(TokenKind.StringLiteral);
+            aliasName = UnquoteString(aliasTok.Text);
+        }
+
+        var parameters = ParseParameterList();
+
+        TypeRefNode? returnType = null;
+        if (!isSub && _ts.Match(TokenKind.KwAs))
+            returnType = ParseTypeRef();
+
+        _ts.ExpectEndOfStatement();
+        return new DeclareNode(start.Line, start.Column, access, isSub,
+            nameTok.Text, libName, aliasName, parameters, returnType);
+    }
+
     // ── Sub / Function / Property ──────────────────────────────────────────
+
+    // True for any keyword that can follow "End" to close a procedure body.
+    // Used as a broad terminator so mismatched End Sub/Function/Property are tolerated.
+    private static bool IsProcedureEndKeyword(TokenKind k) =>
+        k is TokenKind.KwSub or TokenKind.KwFunction or TokenKind.KwProperty;
 
     private SubNode ParseSub(Token start, AccessModifier access, bool isStatic)
     {
@@ -396,10 +475,10 @@ public sealed class Parser
         var parameters = ParseParameterList();
         _ts.ExpectEndOfStatement();
 
-        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && s.PeekAt(1).Kind == TokenKind.KwSub);
+        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && IsProcedureEndKeyword(s.PeekAt(1).Kind));
 
         _ts.Expect(TokenKind.KwEnd);
-        _ts.Expect(TokenKind.KwSub);
+        if (IsProcedureEndKeyword(_ts.Peek().Kind)) _ts.Consume(); // accept any; mismatch tolerated
         _ts.ExpectEndOfStatement();
 
         return new SubNode(start.Line, start.Column, access, isStatic, nameTok.Text, parameters, body);
@@ -415,10 +494,10 @@ public sealed class Parser
             returnType = ParseTypeRef();
         _ts.ExpectEndOfStatement();
 
-        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && s.PeekAt(1).Kind == TokenKind.KwFunction);
+        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && IsProcedureEndKeyword(s.PeekAt(1).Kind));
 
         _ts.Expect(TokenKind.KwEnd);
-        _ts.Expect(TokenKind.KwFunction);
+        if (IsProcedureEndKeyword(_ts.Peek().Kind)) _ts.Consume(); // accept any; mismatch tolerated
         _ts.ExpectEndOfStatement();
 
         return new FunctionNode(start.Line, start.Column, access, isStatic, nameTok.Text, parameters, returnType, body);
@@ -446,10 +525,10 @@ public sealed class Parser
             returnType = ParseTypeRef();
         _ts.ExpectEndOfStatement();
 
-        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && s.PeekAt(1).Kind == TokenKind.KwProperty);
+        var body = ParseBody(isEndOf: s => s.Check(TokenKind.KwEnd) && IsProcedureEndKeyword(s.PeekAt(1).Kind));
 
         _ts.Expect(TokenKind.KwEnd);
-        _ts.Expect(TokenKind.KwProperty);
+        if (IsProcedureEndKeyword(_ts.Peek().Kind)) _ts.Consume(); // accept any; mismatch tolerated
         _ts.ExpectEndOfStatement();
 
         return new PropertyNode(start.Line, start.Column, access, isStatic, propKind, nameTok.Text, parameters, returnType, body);
@@ -520,7 +599,23 @@ public sealed class Parser
             throw new ParseException($"Expected type name, found '{nameTok.Text}'", nameTok.Line, nameTok.Column);
         _ts.Consume();
 
+        // Handle dotted type names: ADODB.Connection, Scripting.Dictionary, etc.
         string typeName = nameTok.Text;
+        while (_ts.Peek().Kind == TokenKind.Dot)
+        {
+            _ts.Consume(); // dot
+            var part = ExpectIdentifierOrKeyword();
+            typeName += "." + part.Text;
+        }
+
+        // Fixed-length string: String * n  (e.g. As String * 80)
+        // Translate as plain String — the fixed-length constraint is dropped.
+        if (typeName.Equals("String", StringComparison.OrdinalIgnoreCase) &&
+            _ts.Check(TokenKind.Star))
+        {
+            _ts.Consume(); // *
+            _ts.Consume(); // the length literal
+        }
         bool isArray = false;
         int arrayRank = 0;
 
@@ -573,6 +668,19 @@ public sealed class Parser
         _ts.SkipNewlines();
         var t = _ts.Peek();
 
+        // Label: any token (identifier OR keyword) immediately followed by ':' on the same line.
+        // e.g. "MyLabel:", "SAIDA:", "ERROR:" (keyword used as label name)
+        if (t.Kind == TokenKind.Identifier || t.Kind >= TokenKind.KwPublic)
+        {
+            var next = _ts.PeekAt(1);
+            if (next.Kind == TokenKind.Colon && next.Line == t.Line)
+            {
+                _ts.Consume(); // label name
+                _ts.Consume(); // colon
+                return new LabelNode(t.Line, t.Column, t.Text);
+            }
+        }
+
         return t.Kind switch
         {
             TokenKind.Comment => ParseComment(),
@@ -592,11 +700,21 @@ public sealed class Parser
             TokenKind.KwReturn => ParseReturn(),
             TokenKind.KwExit => ParseExit(),
             TokenKind.KwEnd => ParseEndStatement(),
+            TokenKind.KwError => ParseErrorStatement(),
+            // Numeric line label: "10 Statement" — consume the number, emit a LabelNode.
+            // The body loop will parse the following statement on the next iteration.
+            TokenKind.IntegerLiteral => ParseNumericLabel(),
             TokenKind.KwSet => ParseSetAssignment(),
             TokenKind.KwLet => ParseLetAssignment(),
             TokenKind.KwCall => ParseCallStatement(),
             TokenKind.KwAttribute => ParseAttributeLine(),
+            // Conditional compilation directives: #If, #ElseIf, #Else, #End If
+            // Skip the directive line; include code from all branches.
+            TokenKind.Hash when IsConditionalCompilationDirective() => SkipConditionalDirectiveLine(t),
             // Identifier or keyword used as call/assignment
+            _ when t.Kind == TokenKind.Identifier &&
+                   t.Text.Equals("ReDim", StringComparison.OrdinalIgnoreCase) => ParseReDim(),
+            _ when IsFileIOStatement(t) => SkipFileIOStatement(t),
             _ when IsStatementStart(t.Kind) => ParseAssignmentOrCall(),
             _ => throw new ParseException($"Unexpected token '{t.Text}' in statement", t.Line, t.Column)
         };
@@ -645,14 +763,66 @@ public sealed class Parser
         return new ConstDeclarationNode(start.Line, start.Column, AccessModifier.Private, declarators);
     }
 
+    private ReDimNode ParseReDim()
+    {
+        var start = _ts.Consume(); // "ReDim" identifier
+        bool isPreserve = _ts.Peek().Kind == TokenKind.Identifier &&
+                          _ts.Peek().Text.Equals("Preserve", StringComparison.OrdinalIgnoreCase);
+        if (isPreserve) _ts.Consume();
+
+        var declarators = new List<VariableDeclaratorNode>();
+        declarators.Add(ParseVariableDeclarator());
+        while (_ts.Match(TokenKind.Comma))
+            declarators.Add(ParseVariableDeclarator());
+
+        _ts.ExpectEndOfStatement();
+        return new ReDimNode(start.Line, start.Column, isPreserve, declarators);
+    }
+
+    // VB6 file I/O statements — out of scope; skip the line and emit a comment placeholder.
+    private bool IsFileIOStatement(Token t)
+    {
+        if (t.Kind != TokenKind.Identifier) return false;
+        var text = t.Text;
+        if (text.Equals("Open",  StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Close", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Print", StringComparison.OrdinalIgnoreCase) &&
+            _ts.PeekAt(1).Kind == TokenKind.Hash) return true;
+        if (text.Equals("Line",  StringComparison.OrdinalIgnoreCase) &&
+            _ts.PeekAt(1).Kind == TokenKind.Identifier &&
+            _ts.PeekAt(1).Text.Equals("Input", StringComparison.OrdinalIgnoreCase)) return true;
+        if (text.Equals("Get",   StringComparison.OrdinalIgnoreCase) &&
+            _ts.PeekAt(1).Kind == TokenKind.Hash) return true;
+        if (text.Equals("Put",   StringComparison.OrdinalIgnoreCase) &&
+            _ts.PeekAt(1).Kind == TokenKind.Hash) return true;
+        return false;
+    }
+
+    private CommentNode SkipFileIOStatement(Token t)
+    {
+        _ts.SkipToEndOfLine();
+        return new CommentNode(t.Line, t.Column, $"' TODO: File I/O not supported — skipped: {t.Text}");
+    }
+
+    // Returns true when the current Hash token is the start of a #If/#ElseIf/#Else/#End directive.
+    private bool IsConditionalCompilationDirective()
+    {
+        // Hash must be followed by If, ElseIf, Else, or End (possibly with If after)
+        var next = _ts.PeekAt(1);
+        return next.Kind is TokenKind.KwIf or TokenKind.KwElseIf or TokenKind.KwElse or TokenKind.KwEnd;
+    }
+
+    private CommentNode? SkipConditionalDirectiveLine(Token t)
+    {
+        _ts.SkipToEndOfLine();
+        return null; // directive line is noise; code inside the block is parsed normally
+    }
+
     private AstNode ParseEndStatement()
     {
         var start = _ts.Peek(); // KwEnd
         var next = _ts.PeekAt(1);
 
-        // End Sub / End Function / End Property / End If / End Select / End With / End Enum / End Type
-        // — these are handled by their parent parsers, so if we see them here it's an error
-        // UNLESS it's a bare End (application termination — rare in DLLs)
         if (next.Kind is TokenKind.Newline or TokenKind.EndOfFile or TokenKind.Colon)
         {
             _ts.Consume();
@@ -660,8 +830,17 @@ public sealed class Parser
             return new EndStatementNode(start.Line, start.Column);
         }
 
-        // This shouldn't be reached in normal parsing because the parent body loop
-        // checks isEndOf before calling ParseStatement. Treat as bare End.
+        // Mismatched procedure terminator (e.g. "End Function" inside a Property Get).
+        // VB6 is lenient about these. Consume both tokens so parsing can continue.
+        if (next.Kind is TokenKind.KwSub or TokenKind.KwFunction or TokenKind.KwProperty)
+        {
+            _ts.Consume(); // End
+            _ts.Consume(); // Sub/Function/Property
+            _ts.ExpectEndOfStatement();
+            return new EndStatementNode(start.Line, start.Column);
+        }
+
+        // Bare End or other block terminator — let parent handle it via isEndOf.
         _ts.Consume();
         return new EndStatementNode(start.Line, start.Column);
     }
@@ -692,6 +871,21 @@ public sealed class Parser
         return new ReturnNode(t.Line, t.Column);
     }
 
+    private ErrorStatementNode ParseErrorStatement()
+    {
+        var start = _ts.Expect(TokenKind.KwError);
+        var num = ParseExpression();
+        _ts.ExpectEndOfStatement();
+        return new ErrorStatementNode(start.Line, start.Column, num);
+    }
+
+    private LabelNode ParseNumericLabel()
+    {
+        var t = _ts.Consume(); // integer literal used as a line label
+        // Do NOT call ExpectEndOfStatement — the actual statement follows on the same line.
+        return new LabelNode(t.Line, t.Column, t.Text);
+    }
+
     private GoToNode ParseGoTo()
     {
         var start = _ts.Expect(TokenKind.KwGoTo);
@@ -713,6 +907,13 @@ public sealed class Parser
     private OnErrorNode ParseOnError()
     {
         var start = _ts.Expect(TokenKind.KwOn);
+
+        // "On Local Error" is a VB6 variant meaning the same as "On Error" but
+        // scoped to the current procedure. "Local" is not a keyword — consume it as identifier.
+        if (_ts.Peek().Kind == TokenKind.Identifier &&
+            _ts.Peek().Text.Equals("Local", StringComparison.OrdinalIgnoreCase))
+            _ts.Consume();
+
         _ts.Expect(TokenKind.KwError);
 
         if (_ts.Match(TokenKind.KwResume))
@@ -1053,18 +1254,6 @@ public sealed class Parser
 
     private AstNode ParseAssignmentOrCall()
     {
-        // Check for label: Identifier immediately followed by Colon (on same line)
-        if (_ts.Peek().Kind == TokenKind.Identifier)
-        {
-            var next = _ts.PeekAt(1);
-            if (next.Kind == TokenKind.Colon && next.Line == _ts.Peek().Line)
-            {
-                var labelTok = _ts.Consume();
-                _ts.Consume(); // colon
-                return new LabelNode(labelTok.Line, labelTok.Column, labelTok.Text);
-            }
-        }
-
         var target = ParsePostfix();
 
         // Assignment: target = expr
@@ -1124,6 +1313,14 @@ public sealed class Parser
         // Missing argument: just a comma follows
         if (start.Kind == TokenKind.Comma)
             return new ArgumentNode(start.Line, start.Column, null, true, null);
+
+        // ByVal/ByRef in call argument list (e.g. CopyMemory ByVal ptr, ByVal src, len).
+        // This is a runtime hint — discard the keyword and parse the expression.
+        if (start.Kind is TokenKind.KwByVal or TokenKind.KwByRef)
+        {
+            _ts.Consume();
+            start = _ts.Peek();
+        }
 
         // Named argument: name := expr
         if (start.Kind == TokenKind.Identifier && _ts.PeekAt(1).Kind == TokenKind.Colon
