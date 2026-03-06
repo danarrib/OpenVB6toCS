@@ -1,21 +1,82 @@
-# Open Visual Basic 6 to C# Migration Tool / Translator
+# OpenVB6toCS — VB6 to C# Translator
 
-![logo](https://user-images.githubusercontent.com/17026744/79247080-68442000-7e50-11ea-9137-faeec5209107.png)
+An open-source, free Visual Basic 6 to C# source code translator targeting **ActiveX DLLs** — business logic components with no UI.
 
-This is an Open Source and Free Visual Basic 6 to C# Translator. It's intendend to convert Microsoft Visual Basic 6 code to C# code, to facilitate the task of converting the VB6 code to the .NET platform.
+## Scope
 
-The goal is to be capable to convert most of the VB6 code to C#, reducing the amount of refactoring.
+**Supported input:**
+- `.vbp` project files (primary mode) — translates all classes and modules in one go
+- `.cls` class modules → `public class`
+- `.bas` standard modules → `public static class`
 
-Here's some tips that can help to convert:
+**In scope:**
+- Fields, constants, enums, user-defined types (`Type`)
+- Methods (`Sub`, `Function`), properties (`Property Get/Let/Set`)
+- Control flow: `If/ElseIf/Else`, `Select Case`, `For/Next`, `For Each`, `While`, `Do/Loop`, `With`
+- Error handling: `On Error GoTo`, `On Error Resume Next`, `Resume`, `Err.Raise`
+- COM interfaces: `Implements`
+- Parameters: `ByVal`, `ByRef`, `Optional`, `ParamArray`
+- Win32 API declarations (`Declare Sub/Function`)
+- External COM references — handled via a three-tier strategy (see [ROADMAP.md](ROADMAP.md))
 
-* It works better for form-less applications (like ActiveX DLLs used as COM+ components)
-* Avoid using Modules (.BAS) on your project. Use only Classes.
-* Avoid using another referenced components. They are probably the part that you'll need to refactor.
+**Out of scope:**
+- `.frm` forms, `.ctl` UserControls — skipped with a warning
+- File I/O statements (`Open`, `Close`, `Print #`, etc.) — skipped with a `// TODO` comment
 
-What it already does?
-* Fields declarations (`public xyz as String` becomes `public string xyz;`)
-* Basic datatype conversion (`String` to `string`, `Long` to `int`, `Integer` to `short`, etc)
-* Enum declarations
-* Keeps the comments
+## Usage
 
-It's on a VERY EARLY stage of development, so it probably won't be as much useful for you. But feel free to try.
+```bash
+# Translate a full VB6 project (primary mode)
+dotnet run --project src/VB6toCS.Cli -- MyProject.vbp
+
+# Parse a single file and print its AST tree (diagnostic mode)
+dotnet run --project src/VB6toCS.Cli -- Calculator.cls
+```
+
+### Project mode output
+
+```
+MyProject/
+  ClassName.cs        ← one .cs per source file
+  ModuleName.cs
+  ...
+  MyProject.csproj    ← SDK-style, targets net8.0, ready to build
+```
+
+COM libraries with no known .NET mapping get a `<COMReference>` entry in the `.csproj` so the project compiles immediately via interop.
+
+### Requirements
+
+- `Option Explicit` is **required** in every source file. Files without it are rejected with a clear error — add it to the top of the file and re-run.
+
+## Current status
+
+The pipeline is being built stage by stage:
+
+| Stage | Description | Status |
+|---|---|---|
+| 0 | VBP project reader + `.csproj` writer | ✅ Complete |
+| 1 | Lexer (tokenizer) | ✅ Complete |
+| 2 | Parser → AST | ✅ Complete |
+| 3 | Semantic analysis (symbol table, type resolution) | Next |
+| 4 | IR transformation (VB6 patterns → C# patterns) | Planned |
+| 5 | C# code generation | Planned |
+| 6 | Roslyn formatting + review annotations | Planned |
+
+**Integration test:** `D46O003_1080.vbp` — a real-world production ActiveX DLL (136 classes, 1 module, 0 forms, 6 COM references). All 137 files parse successfully.
+
+## Architecture
+
+```
+VB6toCS.sln
+src/
+  VB6toCS.Core/       ← translator engine (pure .NET 8, no external parser deps)
+    Lexing/           ← hand-written VB6 lexer
+    Parsing/          ← recursive descent parser, AST node types, AstPrinter
+    Projects/         ← VbpReader, CsprojWriter
+  VB6toCS.Cli/        ← command-line entry point
+samples/
+  Calculator.vbp/.cls ← sample project for quick testing
+```
+
+See [ROADMAP.md](ROADMAP.md) for the full pipeline design and implementation notes.
