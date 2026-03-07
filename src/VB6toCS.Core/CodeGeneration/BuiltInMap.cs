@@ -132,7 +132,9 @@ internal static class BuiltInMap
 
     public static bool TryGetFunction(string name, string[] args, out string result)
     {
-        if (Functions.TryGetValue(name, out var fn))
+        // Strip VB6 type-suffix '$' (e.g. Mid$ → Mid, Left$ → Left, Chr$ → Chr)
+        string lookup = name.EndsWith('$') ? name[..^1] : name;
+        if (Functions.TryGetValue(lookup, out var fn))
         {
             result = fn(args);
             return true;
