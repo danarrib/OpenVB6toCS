@@ -21,6 +21,17 @@ public sealed record ErrorStatementNode(
     int Column,
     ExpressionNode ErrorNumber) : AstNode(Line, Column);
 
+/// <summary>
+/// Return-value assignment inside a Function or Property Get body:
+/// 'FunctionName = expr'. Produced by Stage 3 semantic analysis.
+/// The code generator emits this as 'return expr;' (simple case) or assigns
+/// to a '_result' local and returns it at the end of the method.
+/// </summary>
+public sealed record FunctionReturnNode(
+    int Line,
+    int Column,
+    ExpressionNode Value) : AstNode(Line, Column);
+
 public sealed record AssignmentNode(
     int Line,
     int Column,

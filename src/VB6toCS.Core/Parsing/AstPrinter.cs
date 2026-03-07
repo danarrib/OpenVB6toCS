@@ -89,6 +89,29 @@ public static class AstPrinter
                 PrintNodes(p.Body, writer, indent + "  ");
                 break;
 
+            case CsPropertyNode cp:
+                var cpType = cp.Type != null ? $" As {cp.Type.TypeName}" : "";
+                writer.WriteLine($"{indent}CsPropertyNode '{cp.Name}' [{cp.Access}]{(cp.IsStatic ? " [Static]" : "")}{cpType}");
+                if (cp.GetBody != null)
+                {
+                    writer.WriteLine($"{indent}  Get:");
+                    foreach (var pm in cp.GetParameters) PrintParam(pm, writer, indent + "    ");
+                    PrintNodes(cp.GetBody, writer, indent + "    ");
+                }
+                if (cp.LetBody != null)
+                {
+                    writer.WriteLine($"{indent}  Let:");
+                    foreach (var pm in cp.LetParameters) PrintParam(pm, writer, indent + "    ");
+                    PrintNodes(cp.LetBody, writer, indent + "    ");
+                }
+                if (cp.SetBody != null)
+                {
+                    writer.WriteLine($"{indent}  Set:");
+                    foreach (var pm in cp.SetParameters) PrintParam(pm, writer, indent + "    ");
+                    PrintNodes(cp.SetBody, writer, indent + "    ");
+                }
+                break;
+
             case AssignmentNode a:
                 var prefix = a.IsSet ? "Set " : a.IsLet ? "Let " : "";
                 writer.WriteLine($"{indent}AssignmentNode {prefix}{ExprStr(a.Target)} = {ExprStr(a.Value)}");
@@ -197,6 +220,10 @@ public static class AstPrinter
                 writer.WriteLine($"{indent}ErrorStatementNode Error {ExprStr(e.ErrorNumber)}");
                 break;
 
+            case FunctionReturnNode r:
+                writer.WriteLine($"{indent}FunctionReturnNode = {ExprStr(r.Value)}");
+                break;
+
             default:
                 writer.WriteLine($"{indent}{node.GetType().Name}");
                 break;
@@ -237,6 +264,7 @@ public static class AstPrinter
         BangAccessNode b => $"{ExprStr(b.Object)}!{b.MemberName}",
         WithMemberAccessNode w => $".{w.MemberName}",
         CallOrIndexNode c => $"{ExprStr(c.Target)}({string.Join(", ", c.Arguments.Select(ArgStr))})",
+        IndexNode ix => $"{ExprStr(ix.Target)}[{string.Join(", ", ix.Arguments.Select(ArgStr))}]",
         NewObjectNode n => $"New {n.TypeName}",
         TypeOfIsNode t => $"TypeOf {ExprStr(t.Operand)} Is {t.TypeName}",
         _ => e.GetType().Name

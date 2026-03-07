@@ -1,3 +1,4 @@
+using VB6toCS.Core.Analysis;
 using VB6toCS.Core.Lexing;
 using VB6toCS.Core.Parsing;
 using VB6toCS.Core.Parsing.Nodes;
@@ -102,24 +103,37 @@ static int RunProject(string vbpPath, CliOptions options)
         }
 
         // Stage 2+: validate Option Explicit and parse
+        ModuleNode module;
         try
         {
             TokenListValidator.RequireOptionExplicit(tokens, src.FullPath);
-            var module = new Parser(tokens, src.FullPath).Parse();
-            parsed.Add((src, module));
-            ok++;
-            Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
+            module = new Parser(tokens, src.FullPath).Parse();
         }
         catch (VB6SourceException ex)
         {
             Console.WriteLine($"  [REJECTED] {src.Name}  — {ex.Message}");
             errors++;
+            continue;
         }
         catch (ParseException ex)
         {
             Console.WriteLine($"  [ERROR   ] {src.Name}  — {ex.Message}");
             errors++;
+            continue;
         }
+
+        // Stage 3+: semantic analysis
+        if (options.UpToStage >= 3)
+        {
+            var analyser = new Analyser();
+            module = analyser.Analyse(module);
+            foreach (var d in analyser.Diagnostics)
+                Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
+        }
+
+        parsed.Add((src, module));
+        ok++;
+        Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
     }
 
     Console.WriteLine();
@@ -137,12 +151,18 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
-    // Stages 3–4: not yet implemented
-    if (options.UpToStage <= 4)
+    // Stage 3: diagnostic only — no output files
+    if (options.UpToStage == 3)
     {
-        string stageName = options.UpToStage == 3 ? "Semantic analysis" : "IR transformation";
-        Console.WriteLine($"Stage {options.UpToStage} ({stageName}) is not yet implemented.");
-        Console.WriteLine($"Pipeline stopped after stage 2. {ok} file(s) parsed. No output written.");
+        Console.WriteLine($"Stage 3 complete. {ok} file(s) analysed. No output written.");
+        return 0;
+    }
+
+    // Stage 4: not yet implemented
+    if (options.UpToStage == 4)
+    {
+        Console.WriteLine("Stage 4 (IR transformation) is not yet implemented.");
+        Console.WriteLine($"Pipeline stopped after stage 3. {ok} file(s) analysed. No output written.");
         return 0;
     }
 
@@ -220,6 +240,15 @@ static int RunSingleFile(string path, CliOptions options)
     try
     {
         var module = new Parser(tokens, path).Parse();
+
+        if (options.UpToStage >= 3)
+        {
+            var analyser = new Analyser();
+            module = analyser.Analyse(module);
+            foreach (var d in analyser.Diagnostics)
+                Console.Error.WriteLine($"Warning: {d}");
+        }
+
         Console.WriteLine($"Parsing: {path}");
         Console.WriteLine(new string('-', 60));
         AstPrinter.Print(module, Console.Out);

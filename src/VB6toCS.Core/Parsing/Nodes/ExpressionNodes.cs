@@ -70,6 +70,17 @@ public sealed record WithMemberAccessNode(
     int Column,
     string MemberName) : ExpressionNode(Line, Column);
 
+/// <summary>
+/// Array element access: arr(i) or arr(i, j).
+/// Produced by Stage 3 when a CallOrIndexNode target is resolved as an array variable.
+/// Code generator emits arr[i] / arr[i, j].
+/// </summary>
+public sealed record IndexNode(
+    int Line,
+    int Column,
+    ExpressionNode Target,
+    IReadOnlyList<ArgumentNode> Arguments) : ExpressionNode(Line, Column);
+
 /// <summary>foo(x, y) — ambiguous call vs. array index; resolved in Stage 3.</summary>
 public sealed record CallOrIndexNode(
     int Line,
