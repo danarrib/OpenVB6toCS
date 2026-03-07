@@ -3,6 +3,7 @@ using VB6toCS.Core.Lexing;
 using VB6toCS.Core.Parsing;
 using VB6toCS.Core.Parsing.Nodes;
 using VB6toCS.Core.Projects;
+using VB6toCS.Core.Transformation;
 
 // ── Argument parsing ────────────────────────────────────────────────────────
 
@@ -131,6 +132,15 @@ static int RunProject(string vbpPath, CliOptions options)
                 Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
         }
 
+        // Stage 4+: IR transformation (type normalization + error handling)
+        if (options.UpToStage >= 4)
+        {
+            var transformer = new Transformer();
+            module = transformer.Transform(module);
+            foreach (var d in transformer.Diagnostics)
+                Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
+        }
+
         parsed.Add((src, module));
         ok++;
         Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
@@ -158,11 +168,10 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
-    // Stage 4: not yet implemented
+    // Stage 4: diagnostic only — no output files
     if (options.UpToStage == 4)
     {
-        Console.WriteLine("Stage 4 (IR transformation) is not yet implemented.");
-        Console.WriteLine($"Pipeline stopped after stage 3. {ok} file(s) analysed. No output written.");
+        Console.WriteLine($"Stage 4 complete. {ok} file(s) transformed. No output written.");
         return 0;
     }
 
@@ -246,6 +255,14 @@ static int RunSingleFile(string path, CliOptions options)
             var analyser = new Analyser();
             module = analyser.Analyse(module);
             foreach (var d in analyser.Diagnostics)
+                Console.Error.WriteLine($"Warning: {d}");
+        }
+
+        if (options.UpToStage >= 4)
+        {
+            var transformer = new Transformer();
+            module = transformer.Transform(module);
+            foreach (var d in transformer.Diagnostics)
                 Console.Error.WriteLine($"Warning: {d}");
         }
 

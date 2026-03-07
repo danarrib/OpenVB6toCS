@@ -216,6 +216,14 @@ public static class AstPrinter
                 writer.WriteLine($"{indent}EndStatementNode");
                 break;
 
+            case TryCatchNode tc:
+                writer.WriteLine($"{indent}TryCatchNode");
+                writer.WriteLine($"{indent}  Try:");
+                PrintNodes(tc.TryBody, writer, indent + "    ");
+                writer.WriteLine($"{indent}  Catch ({tc.CatchVariable}):");
+                PrintNodes(tc.CatchBody, writer, indent + "    ");
+                break;
+
             case ErrorStatementNode e:
                 writer.WriteLine($"{indent}ErrorStatementNode Error {ExprStr(e.ErrorNumber)}");
                 break;

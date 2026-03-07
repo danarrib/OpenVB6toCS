@@ -173,3 +173,15 @@ public sealed record CommentNode(
     string Text) : AstNode(Line, Column);
 
 public sealed record EndStatementNode(int Line, int Column) : AstNode(Line, Column);
+
+/// <summary>
+/// Structured try/catch block produced by Stage 4 from the VB6 pattern:
+///   On Error GoTo label  /  [guarded body]  /  Exit Sub|Function  /  label:  /  [handler body]
+/// The CatchVariable name ("_ex") is available to the code generator for the catch parameter.
+/// </summary>
+public sealed record TryCatchNode(
+    int Line,
+    int Column,
+    IReadOnlyList<AstNode> TryBody,
+    string CatchVariable,
+    IReadOnlyList<AstNode> CatchBody) : AstNode(Line, Column);
