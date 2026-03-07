@@ -32,7 +32,19 @@ internal static class BuiltInMap
             ["Split"]     = a => $"{Arg(a,0)}.Split({Arg(a,1)})",
             ["Join"]      = a => $"string.Join({Arg(a,1)}, {Arg(a,0)})",
             ["Space"]     = a => $"new string(' ', {One(a)})",
-            ["String"]    = a => $"new string({Arg(a,1)}, {Arg(a,0)})",
+            ["String"]    = a =>
+            {
+                string charArg = Arg(a, 1);
+                // VB6 String(n, c): c may be a string literal "x" → char literal 'x',
+                // or a number (char code) → (char)n, or a variable → var[0].
+                if (charArg.StartsWith('"') && charArg.EndsWith('"') && charArg.Length >= 3)
+                    charArg = $"'{charArg[1]}'"; // "0" → '0'
+                else if (long.TryParse(charArg, out _))
+                    charArg = $"(char){charArg}"; // 48 → (char)48
+                else
+                    charArg = $"{charArg}[0]";   // variable → variable[0]
+                return $"new string({charArg}, {Arg(a, 0)})";
+            },
             ["StrReverse"] = a => $"new string({One(a)}.Reverse().ToArray())",
             ["Chr"]       = a => $"((char){One(a)}).ToString()",
             ["Asc"]       = a => $"(int){One(a)}[0]",
