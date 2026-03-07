@@ -172,6 +172,9 @@ static int RunProject(string vbpPath, CliOptions options)
     // ── Cross-module enum member map (used by code generator for qualification) ─
     var enumMemberMap = BuildEnumMemberMap(stage3List.Select(r => r.Module));
 
+    // ── Set of field names whose declared type is an enum (suppresses int cast) ─
+    var enumTypedFieldNames = BuildEnumTypedFieldNames(stage3List.Select(r => r.Module), enumMemberMap);
+
     // ── Loop 2: stage 4 — IR transformation with inferred collection types ────
     var parsed = new List<(VbSourceFile Src, ModuleNode Module)>();
 
@@ -206,7 +209,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -334,6 +337,51 @@ static int PrintError(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
     return 1;
+}
+
+/// <summary>
+/// Builds a set of field/property/UDT-field names (across all modules) whose
+/// declared VB6 type is an enum type.  Used by the code generator to suppress
+/// the (int) cast when both sides of a comparison are already enum-typed.
+/// </summary>
+static IReadOnlySet<string> BuildEnumTypedFieldNames(
+    IEnumerable<ModuleNode> modules,
+    IReadOnlyDictionary<string, (string ModuleName, string EnumName)> enumMemberMap)
+{
+    // Collect every enum TYPE name (not member name) from the map's values.
+    var enumTypeNames = new HashSet<string>(
+        enumMemberMap.Values.Select(v => v.EnumName),
+        StringComparer.OrdinalIgnoreCase);
+
+    var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case FieldNode f:
+                    foreach (var d in f.Declarators)
+                        if (d.TypeRef != null && enumTypeNames.Contains(d.TypeRef.TypeName))
+                            result.Add(d.Name);
+                    break;
+
+                case CsPropertyNode p:
+                    if (p.Type != null && enumTypeNames.Contains(p.Type.TypeName))
+                        result.Add(p.Name);
+                    break;
+
+                case UdtNode u:
+                    foreach (var f in u.Fields)
+                        if (enumTypeNames.Contains(f.TypeRef.TypeName))
+                            result.Add(f.Name);
+                    break;
+            }
+        }
+    }
+
+    return result;
 }
 
 /// <summary>

@@ -17,19 +17,27 @@ public sealed class CodeGenerator
     // Cross-module enum member map: memberName → (moduleName, enumName).
     // Built by the caller from all Stage-3 ASTs; null in single-file diagnostic mode.
     private readonly IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? _enumMemberMap;
+
+    // Set of field/property/UDT-field names (any module) whose declared type is an enum.
+    // Used to suppress the (int) cast when both sides of a comparison are enum-typed.
+    private readonly IReadOnlySet<string>? _enumTypedFieldNames;
+
     private string _currentModuleName = "";
 
     private CodeGenerator(bool isStatic,
-        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap)
+        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
+        IReadOnlySet<string>? enumTypedFieldNames)
     {
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
+        _enumTypedFieldNames = enumTypedFieldNames;
     }
 
     public static string Generate(ModuleNode module, bool isStaticModule,
-        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap = null)
+        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap = null,
+        IReadOnlySet<string>? enumTypedFieldNames = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -610,6 +618,23 @@ public sealed class CodeGenerator
         e is IdentifierNode id &&
         _enumMemberMap.ContainsKey(id.Name);
 
+    /// <summary>
+    /// Returns true when the terminal member name of the expression is a field,
+    /// property, or UDT field whose VB6 declared type is an enum type.
+    /// Used to suppress the (int) cast when the other side is already enum-typed.
+    /// </summary>
+    private bool IsEnumTypedField(ExpressionNode e)
+    {
+        if (_enumTypedFieldNames == null) return false;
+        string? name = e switch
+        {
+            IdentifierNode id    => id.Name,
+            MemberAccessNode m   => m.MemberName,
+            _                    => null,
+        };
+        return name != null && _enumTypedFieldNames.Contains(name);
+    }
+
     private string MapBinary(BinaryExpressionNode b)
     {
         string left  = Expr(b.Left);
@@ -625,11 +650,12 @@ public sealed class CodeGenerator
 
         // In C# enum values cannot be implicitly compared with int fields.
         // In VB6 all enums are plain integers, so the comparison always worked.
-        // Cast the enum side to int so the generated C# compiles without error.
+        // Cast the enum side to (int) — but only when the other side is NOT already
+        // an enum-typed field (if both sides are the same enum type, no cast is needed).
         if (NumericComparisonOps.Contains(b.Operator))
         {
-            if (IsEnumMember(b.Left))  left  = $"(int){left}";
-            if (IsEnumMember(b.Right)) right = $"(int){right}";
+            if (IsEnumMember(b.Left)  && !IsEnumTypedField(b.Right)) left  = $"(int){left}";
+            if (IsEnumMember(b.Right) && !IsEnumTypedField(b.Left))  right = $"(int){right}";
         }
 
         string op = b.Operator switch

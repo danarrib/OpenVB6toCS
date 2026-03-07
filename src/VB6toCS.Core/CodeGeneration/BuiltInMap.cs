@@ -61,6 +61,7 @@ internal static class BuiltInMap
             ["CBool"]     = a => $"Convert.ToBoolean({One(a)})",
             ["CByte"]     = a => $"Convert.ToByte({One(a)})",
             ["CDate"]     = a => $"Convert.ToDateTime({One(a)})",
+            ["CVDate"]    = a => $"Convert.ToDateTime({One(a)})",
             ["Val"]       = a => $"Convert.ToDouble({One(a)})",
             ["Str"]       = a => $"{One(a)}.ToString()",
 
