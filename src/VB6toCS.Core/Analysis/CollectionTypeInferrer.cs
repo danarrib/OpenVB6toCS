@@ -101,7 +101,7 @@ public sealed class CollectionTypeInferrer
                 locals[p.Name] = p.TypeRef.TypeName;
         CollectLocals(body, locals);
 
-        ScanBody(body, moduleName, locals);
+        ScanBody(body, moduleName, locals, new Stack<string?>());
     }
 
     private static void CollectLocals(IReadOnlyList<AstNode> body, Dictionary<string, string> locals)
@@ -121,13 +121,25 @@ public sealed class CollectionTypeInferrer
     private void ScanBody(
         IReadOnlyList<AstNode> body,
         string moduleName,
-        Dictionary<string, string> locals)
+        Dictionary<string, string> locals,
+        Stack<string?> withStack)
     {
         foreach (var node in body)
         {
-            RecordAddCall(node, moduleName, locals);
-            foreach (var child in ChildBodies(node))
-                ScanBody(child, moduleName, locals);
+            RecordAddCall(node, moduleName, locals, withStack);
+
+            // WithNode is handled specially so we can push/pop the With type.
+            if (node is WithNode w)
+            {
+                withStack.Push(InferType(w.Object, moduleName, locals));
+                ScanBody(w.Body, moduleName, locals, withStack);
+                withStack.Pop();
+            }
+            else
+            {
+                foreach (var child in ChildBodies(node))
+                    ScanBody(child, moduleName, locals, withStack);
+            }
         }
     }
 
@@ -136,7 +148,8 @@ public sealed class CollectionTypeInferrer
     private void RecordAddCall(
         AstNode node,
         string moduleName,
-        Dictionary<string, string> locals)
+        Dictionary<string, string> locals,
+        Stack<string?> withStack)
     {
         if (node is not CallStatementNode call) return;
 
@@ -168,7 +181,7 @@ public sealed class CollectionTypeInferrer
         string? elemType = InferType(itemArg.Value, moduleName, locals);
         if (elemType == null) return;
 
-        var target = ResolveCollectionTarget(addMa.Object, moduleName, locals);
+        var target = ResolveCollectionTarget(addMa.Object, moduleName, locals, withStack);
         if (target == null) return;
 
         var key = target.Value;
@@ -186,7 +199,8 @@ public sealed class CollectionTypeInferrer
     private (string mod, string field)? ResolveCollectionTarget(
         ExpressionNode target,
         string moduleName,
-        Dictionary<string, string> locals)
+        Dictionary<string, string> locals,
+        Stack<string?> withStack)
     {
         switch (target)
         {
@@ -197,6 +211,18 @@ public sealed class CollectionTypeInferrer
                     type.Equals("Collection", StringComparison.OrdinalIgnoreCase))
                     return (moduleName, id.Name);
                 break;
+
+            // .colField.Add ... — field on the current With object
+            case WithMemberAccessNode wma:
+            {
+                string? withType = withStack.Count > 0 ? withStack.Peek() : null;
+                if (withType != null &&
+                    _moduleFields.TryGetValue(withType, out var withFields) &&
+                    withFields.TryGetValue(wma.MemberName, out var fieldType) &&
+                    fieldType.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+                    return (withType, wma.MemberName);
+                break;
+            }
 
             // obj.colField.Add ... — field belonging to another class
             case MemberAccessNode ma:
@@ -275,7 +301,7 @@ public sealed class CollectionTypeInferrer
             case ForEachNode  f: yield return f.Body; break;
             case WhileNode    w: yield return w.Body; break;
             case DoLoopNode   d: yield return d.Body; break;
-            case WithNode     w: yield return w.Body; break;
+            // WithNode is handled directly in ScanBody (push/pop stack); omitted here.
         }
     }
 }
