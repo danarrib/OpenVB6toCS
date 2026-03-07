@@ -22,6 +22,7 @@ An open-source, free Visual Basic 6 to C# source code translator targeting **Act
 **Out of scope:**
 - `.frm` forms, `.ctl` UserControls — skipped with a warning
 - File I/O statements (`Open`, `Close`, `Print #`, etc.) — skipped with a `// TODO` comment
+- ADO/DAO data access objects
 
 ## Usage
 
@@ -58,12 +59,12 @@ The pipeline is being built stage by stage:
 | 0 | VBP project reader + `.csproj` writer | ✅ Complete |
 | 1 | Lexer (tokenizer) | ✅ Complete |
 | 2 | Parser → AST | ✅ Complete |
-| 3 | Semantic analysis (symbol table, type resolution) | Next |
-| 4 | IR transformation (VB6 patterns → C# patterns) | Planned |
-| 5 | C# code generation | Planned |
+| 3 | Semantic analysis (symbol table, CallOrIndex resolution, property grouping) | ✅ Complete |
+| 4 | IR transformation (type normalization + error handling restructuring) | ✅ Complete |
+| 5 | C# code generation | Next |
 | 6 | Roslyn formatting + review annotations | Planned |
 
-**Integration test:** `D46O003_1080.vbp` — a real-world production ActiveX DLL (136 classes, 1 module, 0 forms, 6 COM references). All 137 files parse successfully.
+**Integration test:** `D46O003_1080.vbp` — a real-world production ActiveX DLL (136 classes, 1 module, 0 forms, 6 COM references). All 137 files pass through Stage 4 with 0 errors.
 
 ## Architecture
 
@@ -73,10 +74,11 @@ src/
   VB6toCS.Core/       ← translator engine (pure .NET 8, no external parser deps)
     Lexing/           ← hand-written VB6 lexer
     Parsing/          ← recursive descent parser, AST node types, AstPrinter
+    Analysis/         ← semantic analysis (Stage 3)
+    Transformation/   ← IR transformation (Stage 4)
     Projects/         ← VbpReader, CsprojWriter
   VB6toCS.Cli/        ← command-line entry point
 samples/
   Calculator.vbp/.cls ← sample project for quick testing
 ```
 
-See [ROADMAP.md](ROADMAP.md) for the full pipeline design and implementation notes.
