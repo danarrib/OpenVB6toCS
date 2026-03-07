@@ -22,7 +22,18 @@ public sealed class Transformer
     private readonly List<TransformDiagnostic> _diagnostics = [];
     public IReadOnlyList<TransformDiagnostic> Diagnostics => _diagnostics;
 
+    // Inferred Collection element types from the cross-module CollectionTypeInferrer pass.
+    // Key: (moduleName, fieldName).  Value: the single inferred element type.
+    private readonly IReadOnlyDictionary<(string, string), string>? _collectionTypes;
+
     private string _currentContext = "<module>";
+    private string _currentModuleName = "";
+
+    public Transformer(
+        IReadOnlyDictionary<(string, string), string>? collectionTypes = null)
+    {
+        _collectionTypes = collectionTypes;
+    }
 
     // VB6 primitive type names → C# equivalents
     private static readonly Dictionary<string, string> TypeMap =
@@ -39,14 +50,11 @@ public sealed class Transformer
             ["Currency"]   = "decimal",
             ["Variant"]    = "object",
             ["Object"]     = "object",
-            // VB6 Collection is untyped; translated to Collection<object> since the
-            // element type cannot be inferred statically. A REVIEW comment is emitted
-            // in the generated C# and a warning is raised.
-            ["Collection"] = "Collection<object>",
         };
 
     public ModuleNode Transform(ModuleNode module)
     {
+        _currentModuleName = module.Name;
         var members = module.Members.Select(TransformMember).ToList();
         return module with { Members = members };
     }
@@ -91,7 +99,7 @@ public sealed class Transformer
                 SetParameters = NormalizeParams(p.SetParameters),
                 SetBody       = p.SetBody  != null ? TransformBody(p.SetBody,  p.Name + ".Set", p.Line) : null,
             },
-            FieldNode f            => f with { Declarators = NormalizeDeclarators(f.Declarators) },
+            FieldNode f            => f with { Declarators = NormalizeFieldDeclarators(f.Declarators) },
             ConstDeclarationNode c => c with { Declarators = NormalizeDeclarators(c.Declarators) },
             UdtNode u              => u with
             {
@@ -296,27 +304,77 @@ public sealed class Transformer
     private TypeRefNode? NormalizeType(TypeRefNode? t)
     {
         if (t == null) return null;
-        if (!TypeMap.TryGetValue(t.TypeName, out var csName))
-            return t; // COM types, user-defined types, etc. — unchanged
-        if (t.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
-            Warn(_currentContext,
-                "VB6 'Collection' translated to Collection<object> — the element type could not be inferred; " +
-                "consider replacing with List<T> or Dictionary<string, T>.",
-                t.Line, t.Column);
-        return t with { TypeName = csName };
+        return TypeMap.TryGetValue(t.TypeName, out var csName)
+            ? t with { TypeName = csName }
+            : t; // COM types, user-defined types, etc. — unchanged
+    }
+
+    /// <summary>
+    /// Normalizes declarators for module-level fields.
+    /// For Collection fields: uses the inferred element type when available;
+    /// falls back to Collection&lt;object&gt; with a warning.
+    /// </summary>
+    private IReadOnlyList<VariableDeclaratorNode> NormalizeFieldDeclarators(
+        IReadOnlyList<VariableDeclaratorNode> declarators)
+    {
+        if (declarators.Count == 0) return declarators;
+        return declarators.Select(d =>
+        {
+            if (d.TypeRef?.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase) == true)
+                return d with { TypeRef = ResolveCollectionType(d.TypeRef, d.Name, isField: true) };
+            return d with { TypeRef = NormalizeType(d.TypeRef) };
+        }).ToList();
+    }
+
+    /// <summary>
+    /// Normalizes declarators for local variables and ReDim statements.
+    /// Collection locals always become Collection&lt;object&gt; with a warning
+    /// (local variable inference is not currently implemented).
+    /// </summary>
+    private IReadOnlyList<VariableDeclaratorNode> NormalizeDeclarators(
+        IReadOnlyList<VariableDeclaratorNode> declarators)
+    {
+        if (declarators.Count == 0) return declarators;
+        return declarators.Select(d =>
+        {
+            if (d.TypeRef?.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase) == true)
+                return d with { TypeRef = ResolveCollectionType(d.TypeRef, d.Name, isField: false) };
+            return d with { TypeRef = NormalizeType(d.TypeRef) };
+        }).ToList();
     }
 
     private IReadOnlyList<ParameterNode> NormalizeParams(
-        IReadOnlyList<ParameterNode> parameters) =>
-        parameters.Count == 0
-            ? parameters
-            : parameters.Select(p => p with { TypeRef = NormalizeType(p.TypeRef) }).ToList();
+        IReadOnlyList<ParameterNode> parameters)
+    {
+        if (parameters.Count == 0) return parameters;
+        return parameters.Select(p =>
+        {
+            if (p.TypeRef?.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase) == true)
+                return p with { TypeRef = ResolveCollectionType(p.TypeRef, p.Name, isField: false) };
+            return p with { TypeRef = NormalizeType(p.TypeRef) };
+        }).ToList();
+    }
 
-    private IReadOnlyList<VariableDeclaratorNode> NormalizeDeclarators(
-        IReadOnlyList<VariableDeclaratorNode> declarators) =>
-        declarators.Count == 0
-            ? declarators
-            : declarators.Select(d => d with { TypeRef = NormalizeType(d.TypeRef) }).ToList();
+    /// <summary>
+    /// Resolves a Collection TypeRefNode to Collection&lt;T&gt;.
+    /// For fields, consults the cross-module inferred type map first.
+    /// Emits a warning only when no specific type could be determined.
+    /// </summary>
+    private TypeRefNode ResolveCollectionType(TypeRefNode t, string name, bool isField)
+    {
+        string? elemType = null;
+
+        if (isField && _collectionTypes != null)
+            _collectionTypes.TryGetValue((_currentModuleName, name), out elemType);
+
+        if (elemType == null)
+            Warn(_currentContext,
+                $"'{name}' is a Collection whose element type could not be inferred; " +
+                "translated to Collection<object>. Consider replacing with List<T> or Dictionary<string, T>.",
+                t.Line, t.Column);
+
+        return t with { TypeName = $"Collection<{elemType ?? "object"}>" };
+    }
 
     // ── Diagnostic helpers ───────────────────────────────────────────────────
 

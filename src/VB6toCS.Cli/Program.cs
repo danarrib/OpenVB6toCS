@@ -67,10 +67,13 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
-    // Stages 1+: process each source file through the pipeline
+    // ── Loop 1: stages 1–3 ───────────────────────────────────────────────────
+    // Process every file through lexing, parsing, and semantic analysis.
+    // Files that pass stage 2 are collected into stage3List for the second loop.
+
     int errors = 0;
     int ok = 0;
-    var parsed = new List<(VbSourceFile Src, ModuleNode Module)>();
+    var stage3List = new List<(VbSourceFile Src, ModuleNode Module)>();
 
     Console.WriteLine($"Source files ({project.SourceFiles.Count}):");
 
@@ -105,7 +108,7 @@ static int RunProject(string vbpPath, CliOptions options)
             continue;
         }
 
-        // Stage 2+: validate Option Explicit and parse
+        // Stage 2: validate Option Explicit and parse
         ModuleNode module;
         try
         {
@@ -125,7 +128,7 @@ static int RunProject(string vbpPath, CliOptions options)
             continue;
         }
 
-        // Stage 3+: semantic analysis
+        // Stage 3: semantic analysis
         if (options.UpToStage >= 3)
         {
             var analyser = new Analyser();
@@ -134,18 +137,7 @@ static int RunProject(string vbpPath, CliOptions options)
                 Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
         }
 
-        // Stage 4+: IR transformation (type normalization + error handling)
-        if (options.UpToStage >= 4)
-        {
-            var transformer = new Transformer();
-            module = transformer.Transform(module);
-            foreach (var d in transformer.Diagnostics)
-                Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
-        }
-
-        parsed.Add((src, module));
-        ok++;
-        Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
+        stage3List.Add((src, module));
     }
 
     Console.WriteLine();
@@ -156,19 +148,43 @@ static int RunProject(string vbpPath, CliOptions options)
         return 1;
     }
 
-    // Stage 1–2: diagnostic only, no output files
+    // Stage 1–3 diagnostic-only exits
     if (options.UpToStage <= 2)
     {
-        Console.WriteLine($"Stage {options.UpToStage} complete. {ok} file(s) processed. No output written.");
+        Console.WriteLine($"Stage {options.UpToStage} complete. {stage3List.Count} file(s) processed. No output written.");
         return 0;
     }
 
-    // Stage 3: diagnostic only — no output files
     if (options.UpToStage == 3)
     {
-        Console.WriteLine($"Stage 3 complete. {ok} file(s) analysed. No output written.");
+        Console.WriteLine($"Stage 3 complete. {stage3List.Count} file(s) analysed. No output written.");
         return 0;
     }
+
+    // ── Cross-module Collection type inference (between stages 3 and 4) ───────
+    IReadOnlyDictionary<(string, string), string> collectionTypeMap;
+    {
+        var inferrer = new CollectionTypeInferrer();
+        inferrer.Analyse(stage3List.Select(r => r.Module));
+        collectionTypeMap = inferrer.GetInferredTypes();
+    }
+
+    // ── Loop 2: stage 4 — IR transformation with inferred collection types ────
+    var parsed = new List<(VbSourceFile Src, ModuleNode Module)>();
+
+    foreach (var (src, module3) in stage3List)
+    {
+        var transformer = new Transformer(collectionTypeMap);
+        var module = transformer.Transform(module3);
+        foreach (var d in transformer.Diagnostics)
+            Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
+
+        parsed.Add((src, module));
+        ok++;
+        Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
+    }
+
+    Console.WriteLine();
 
     // Stage 4: diagnostic only — no output files
     if (options.UpToStage == 4)
