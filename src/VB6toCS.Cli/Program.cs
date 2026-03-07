@@ -169,6 +169,9 @@ static int RunProject(string vbpPath, CliOptions options)
         collectionTypeMap = inferrer.GetInferredTypes();
     }
 
+    // ── Cross-module enum member map (used by code generator for qualification) ─
+    var enumMemberMap = BuildEnumMemberMap(stage3List.Select(r => r.Module));
+
     // ── Loop 2: stage 4 — IR transformation with inferred collection types ────
     var parsed = new List<(VbSourceFile Src, ModuleNode Module)>();
 
@@ -203,7 +206,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -331,6 +334,40 @@ static int PrintError(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
     return 1;
+}
+
+/// <summary>
+/// Builds a cross-module enum member map from all Stage-3 ASTs.
+/// Maps each public enum member name to its (moduleName, enumName).
+/// Names that appear in more than one module are excluded (ambiguous).
+/// </summary>
+static IReadOnlyDictionary<string, (string ModuleName, string EnumName)>
+    BuildEnumMemberMap(IEnumerable<ModuleNode> modules)
+{
+    var map       = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
+    var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            if (member is not EnumNode e) continue;
+            foreach (var em in e.Members)
+            {
+                if (!map.TryAdd(em.Name, (module.Name, e.Name)))
+                {
+                    // Member name already seen — mark ambiguous if from a different module
+                    if (!map[em.Name].Item1.Equals(module.Name, StringComparison.OrdinalIgnoreCase))
+                        conflicts.Add(em.Name);
+                }
+            }
+        }
+    }
+
+    foreach (var name in conflicts)
+        map.Remove(name);
+
+    return map;
 }
 
 /// <summary>

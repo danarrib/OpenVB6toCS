@@ -14,11 +14,22 @@ public sealed class CodeGenerator
     private readonly Stack<string> _withStack = new();  // tracks With object expressions
     private readonly HashSet<string> _requiredUsings = new();  // populated during generation
 
-    private CodeGenerator(bool isStatic) => _isStatic = isStatic;
+    // Cross-module enum member map: memberName → (moduleName, enumName).
+    // Built by the caller from all Stage-3 ASTs; null in single-file diagnostic mode.
+    private readonly IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? _enumMemberMap;
+    private string _currentModuleName = "";
 
-    public static string Generate(ModuleNode module, bool isStaticModule)
+    private CodeGenerator(bool isStatic,
+        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap)
     {
-        var gen = new CodeGenerator(isStaticModule);
+        _isStatic = isStatic;
+        _enumMemberMap = enumMemberMap;
+    }
+
+    public static string Generate(ModuleNode module, bool isStaticModule,
+        IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap = null)
+    {
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -37,6 +48,7 @@ public sealed class CodeGenerator
 
     private void GenerateModule(ModuleNode module)
     {
+        _currentModuleName = module.Name;
         string staticKw  = _isStatic ? "static " : "";
         string baseClause = module.Implements.Count > 0
             ? " : " + string.Join(", ", module.Implements)
@@ -78,7 +90,7 @@ public sealed class CodeGenerator
                 break;
 
             case EnumNode e:
-                _w.WriteLine($"{Access(e.Access)}enum {e.Name}");
+                _w.WriteLine($"{Access(e.Access)}enum {e.Name} : int");
                 _w.OpenBrace();
                 foreach (var m in e.Members)
                 {
@@ -518,6 +530,16 @@ public sealed class CodeGenerator
     {
         if (BuiltInMap.TryGetConstant(name, out var csConst))
             return csConst;
+
+        // Qualify enum members from this or other modules.
+        // Same module → "EnumName.MemberName"; other module → "ModuleName.EnumName.MemberName".
+        if (_enumMemberMap != null && _enumMemberMap.TryGetValue(name, out var ep))
+        {
+            return ep.ModuleName.Equals(_currentModuleName, StringComparison.OrdinalIgnoreCase)
+                ? $"{ep.EnumName}.{name}"
+                : $"{ep.ModuleName}.{ep.EnumName}.{name}";
+        }
+
         return name;
     }
 
@@ -659,7 +681,7 @@ public sealed class CodeGenerator
         if (t == null) return "object";
         string name = t.TypeName;
 
-        if (name == "Collection<object>")
+        if (name.StartsWith("Collection<"))
             _requiredUsings.Add("System.Collections.ObjectModel");
 
         // Arrays
