@@ -593,6 +593,23 @@ public sealed class CodeGenerator
         };
     }
 
+    // Comparison operators that may involve enum members compared against int fields.
+    private static readonly HashSet<TokenKind> NumericComparisonOps =
+    [
+        TokenKind.Equals, TokenKind.NotEqual,
+        TokenKind.LessThan, TokenKind.GreaterThan,
+        TokenKind.LessEqual, TokenKind.GreaterEqual,
+    ];
+
+    /// <summary>
+    /// Returns true when the expression is a bare identifier that resolves to
+    /// an enum member in the cross-module enum map.
+    /// </summary>
+    private bool IsEnumMember(ExpressionNode e) =>
+        _enumMemberMap != null &&
+        e is IdentifierNode id &&
+        _enumMemberMap.ContainsKey(id.Name);
+
     private string MapBinary(BinaryExpressionNode b)
     {
         string left  = Expr(b.Left);
@@ -605,6 +622,15 @@ public sealed class CodeGenerator
         // Integer division — emit cast to make intent clear
         if (b.Operator == TokenKind.Backslash)
             return $"((int)({left}) / (int)({right}))";
+
+        // In C# enum values cannot be implicitly compared with int fields.
+        // In VB6 all enums are plain integers, so the comparison always worked.
+        // Cast the enum side to int so the generated C# compiles without error.
+        if (NumericComparisonOps.Contains(b.Operator))
+        {
+            if (IsEnumMember(b.Left))  left  = $"(int){left}";
+            if (IsEnumMember(b.Right)) right = $"(int){right}";
+        }
 
         string op = b.Operator switch
         {
