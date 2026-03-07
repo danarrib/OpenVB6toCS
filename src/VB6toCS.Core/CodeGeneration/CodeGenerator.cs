@@ -12,6 +12,7 @@ public sealed class CodeGenerator
     private readonly CodeWriter _w = new();
     private readonly bool _isStatic;    // true for .bas standard modules
     private readonly Stack<string> _withStack = new();  // tracks With object expressions
+    private readonly HashSet<string> _requiredUsings = new();  // populated during generation
 
     private CodeGenerator(bool isStatic) => _isStatic = isStatic;
 
@@ -19,7 +20,17 @@ public sealed class CodeGenerator
     {
         var gen = new CodeGenerator(isStaticModule);
         gen.GenerateModule(module);
-        return gen._w.ToString();
+
+        string classCode = gen._w.ToString();
+        if (gen._requiredUsings.Count == 0)
+            return classCode;
+
+        var sb = new System.Text.StringBuilder();
+        foreach (var ns in gen._requiredUsings.OrderBy(x => x))
+            sb.AppendLine($"using {ns};");
+        sb.AppendLine();
+        sb.Append(classCode);
+        return sb.ToString();
     }
 
     // ── Module ───────────────────────────────────────────────────────────────
@@ -58,12 +69,12 @@ public sealed class CodeGenerator
 
             case FieldNode f:
                 foreach (var d in f.Declarators)
-                    _w.WriteLine($"{Access(f.Access)}{StaticMod()}{ TypeStr(d.TypeRef, d.Name)} {d.Name};");
+                    _w.WriteLine($"{Access(f.Access)}{StaticMod()}{TypeStr(d.TypeRef, d.Name)} {d.Name};{ReviewComment(d.TypeRef)}");
                 break;
 
             case ConstDeclarationNode c:
                 foreach (var d in c.Declarators)
-                    _w.WriteLine($"{Access(c.Access)}{StaticMod()}const {TypeStr(d.TypeRef, d.Name)} {d.Name} = {(d.DefaultValue != null ? Expr(d.DefaultValue) : "default")};");
+                    _w.WriteLine($"{Access(c.Access)}{StaticMod()}const {TypeStr(d.TypeRef, d.Name)} {d.Name} = {(d.DefaultValue != null ? Expr(d.DefaultValue) : "default")};{ReviewComment(d.TypeRef)}");
                 break;
 
             case EnumNode e:
@@ -202,7 +213,7 @@ public sealed class CodeGenerator
                 {
                     string typeStr = TypeStr(dec.TypeRef, dec.Name);
                     string init    = dec.DefaultValue != null ? $" = {Expr(dec.DefaultValue)}" : "";
-                    _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};");
+                    _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{ReviewComment(dec.TypeRef)}");
                 }
                 break;
 
@@ -473,7 +484,7 @@ public sealed class CodeGenerator
         DateLiteralNode d           => $"DateTime.Parse({d.RawText}) /* date literal */",
 
         IdentifierNode id           => MapIdentifier(id.Name),
-        NewObjectNode n             => $"new {n.TypeName}()",
+        NewObjectNode n             => NewObjectExpr(n),
         TypeOfIsNode t              => $"({Expr(t.Operand)} is {t.TypeName})",
 
         MemberAccessNode m          => $"{Expr(m.Object)}.{m.MemberName}",
@@ -488,6 +499,17 @@ public sealed class CodeGenerator
 
         _                           => $"/* {e.GetType().Name} */"
     };
+
+    private string NewObjectExpr(NewObjectNode n)
+    {
+        // VB6 "New Collection" → C# "new Collection<object>()"
+        if (n.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+        {
+            _requiredUsings.Add("System.Collections.ObjectModel");
+            return "new Collection<object>()";
+        }
+        return $"new {n.TypeName}()";
+    }
 
     private string MapIdentifier(string name)
     {
@@ -629,10 +651,14 @@ public sealed class CodeGenerator
             a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" :
             Expr(a.Value!)));
 
-    private static string TypeStr(TypeRefNode? t, string context)
+    private string TypeStr(TypeRefNode? t, string context)
     {
         if (t == null) return "object";
         string name = t.TypeName;
+
+        if (name == "Collection<object>")
+            _requiredUsings.Add("System.Collections.ObjectModel");
+
         // Arrays
         if (t.IsArray)
         {
@@ -641,6 +667,15 @@ public sealed class CodeGenerator
         }
         return name;
     }
+
+    /// <summary>
+    /// Returns an inline // REVIEW: comment to append to a declaration line,
+    /// or null when no review is needed.
+    /// </summary>
+    private static string? ReviewComment(TypeRefNode? t) =>
+        t?.TypeName == "Collection<object>"
+            ? " // REVIEW: Collection<object> — replace with List<T> or Dictionary<string, T> once element type is known"
+            : null;
 
     private static string Access(AccessModifier a) => a switch
     {

@@ -22,21 +22,27 @@ public sealed class Transformer
     private readonly List<TransformDiagnostic> _diagnostics = [];
     public IReadOnlyList<TransformDiagnostic> Diagnostics => _diagnostics;
 
+    private string _currentContext = "<module>";
+
     // VB6 primitive type names → C# equivalents
     private static readonly Dictionary<string, string> TypeMap =
         new(StringComparer.OrdinalIgnoreCase)
         {
-            ["String"]   = "string",
-            ["Integer"]  = "int",
-            ["Long"]     = "int",
-            ["Single"]   = "float",
-            ["Double"]   = "double",
-            ["Boolean"]  = "bool",
-            ["Byte"]     = "byte",
-            ["Date"]     = "DateTime",
-            ["Currency"] = "decimal",
-            ["Variant"]  = "object",
-            ["Object"]   = "object",
+            ["String"]     = "string",
+            ["Integer"]    = "int",
+            ["Long"]       = "int",
+            ["Single"]     = "float",
+            ["Double"]     = "double",
+            ["Boolean"]    = "bool",
+            ["Byte"]       = "byte",
+            ["Date"]       = "DateTime",
+            ["Currency"]   = "decimal",
+            ["Variant"]    = "object",
+            ["Object"]     = "object",
+            // VB6 Collection is untyped; translated to Collection<object> since the
+            // element type cannot be inferred statically. A REVIEW comment is emitted
+            // in the generated C# and a warning is raised.
+            ["Collection"] = "Collection<object>",
         };
 
     public ModuleNode Transform(ModuleNode module)
@@ -47,42 +53,58 @@ public sealed class Transformer
 
     // ── Member-level transformation ─────────────────────────────────────────
 
-    private AstNode TransformMember(AstNode node) => node switch
+    private AstNode TransformMember(AstNode node)
     {
-        SubNode s => s with
+        // Set context so NormalizeType diagnostics carry a meaningful member name.
+        _currentContext = node switch
         {
-            Parameters = NormalizeParams(s.Parameters),
-            Body       = TransformBody(s.Body, s.Name, s.Line),
-        },
-        FunctionNode f => f with
+            SubNode s          => s.Name,
+            FunctionNode f     => f.Name,
+            CsPropertyNode p   => p.Name,
+            FieldNode          => "<field>",
+            ConstDeclarationNode => "<const>",
+            UdtNode u          => u.Name,
+            DeclareNode d      => d.Name,
+            _                  => "<module>",
+        };
+
+        return node switch
         {
-            Parameters = NormalizeParams(f.Parameters),
-            ReturnType = NormalizeType(f.ReturnType),
-            Body       = TransformBody(f.Body, f.Name, f.Line),
-        },
-        CsPropertyNode p => p with
-        {
-            Type          = NormalizeType(p.Type),
-            GetParameters = NormalizeParams(p.GetParameters),
-            GetBody       = p.GetBody  != null ? TransformBody(p.GetBody,  p.Name + ".Get", p.Line) : null,
-            LetParameters = NormalizeParams(p.LetParameters),
-            LetBody       = p.LetBody  != null ? TransformBody(p.LetBody,  p.Name + ".Let", p.Line) : null,
-            SetParameters = NormalizeParams(p.SetParameters),
-            SetBody       = p.SetBody  != null ? TransformBody(p.SetBody,  p.Name + ".Set", p.Line) : null,
-        },
-        FieldNode f            => f with { Declarators = NormalizeDeclarators(f.Declarators) },
-        ConstDeclarationNode c => c with { Declarators = NormalizeDeclarators(c.Declarators) },
-        UdtNode u              => u with
-        {
-            Fields = u.Fields.Select(f => f with { TypeRef = NormalizeType(f.TypeRef)! }).ToList(),
-        },
-        DeclareNode d => d with
-        {
-            Parameters = NormalizeParams(d.Parameters),
-            ReturnType = NormalizeType(d.ReturnType),
-        },
-        _ => node,
-    };
+            SubNode s => s with
+            {
+                Parameters = NormalizeParams(s.Parameters),
+                Body       = TransformBody(s.Body, s.Name, s.Line),
+            },
+            FunctionNode f => f with
+            {
+                Parameters = NormalizeParams(f.Parameters),
+                ReturnType = NormalizeType(f.ReturnType),
+                Body       = TransformBody(f.Body, f.Name, f.Line),
+            },
+            CsPropertyNode p => p with
+            {
+                Type          = NormalizeType(p.Type),
+                GetParameters = NormalizeParams(p.GetParameters),
+                GetBody       = p.GetBody  != null ? TransformBody(p.GetBody,  p.Name + ".Get", p.Line) : null,
+                LetParameters = NormalizeParams(p.LetParameters),
+                LetBody       = p.LetBody  != null ? TransformBody(p.LetBody,  p.Name + ".Let", p.Line) : null,
+                SetParameters = NormalizeParams(p.SetParameters),
+                SetBody       = p.SetBody  != null ? TransformBody(p.SetBody,  p.Name + ".Set", p.Line) : null,
+            },
+            FieldNode f            => f with { Declarators = NormalizeDeclarators(f.Declarators) },
+            ConstDeclarationNode c => c with { Declarators = NormalizeDeclarators(c.Declarators) },
+            UdtNode u              => u with
+            {
+                Fields = u.Fields.Select(f => f with { TypeRef = NormalizeType(f.TypeRef)! }).ToList(),
+            },
+            DeclareNode d => d with
+            {
+                Parameters = NormalizeParams(d.Parameters),
+                ReturnType = NormalizeType(d.ReturnType),
+            },
+            _ => node,
+        };
+    }
 
     // ── Body-level transformation ───────────────────────────────────────────
 
@@ -271,21 +293,26 @@ public sealed class Transformer
 
     // ── Type normalization helpers ───────────────────────────────────────────
 
-    private static TypeRefNode? NormalizeType(TypeRefNode? t)
+    private TypeRefNode? NormalizeType(TypeRefNode? t)
     {
         if (t == null) return null;
-        return TypeMap.TryGetValue(t.TypeName, out var csName)
-            ? t with { TypeName = csName }
-            : t; // COM types, user-defined types, etc. — unchanged
+        if (!TypeMap.TryGetValue(t.TypeName, out var csName))
+            return t; // COM types, user-defined types, etc. — unchanged
+        if (t.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+            Warn(_currentContext,
+                "VB6 'Collection' translated to Collection<object> — the element type could not be inferred; " +
+                "consider replacing with List<T> or Dictionary<string, T>.",
+                t.Line, t.Column);
+        return t with { TypeName = csName };
     }
 
-    private static IReadOnlyList<ParameterNode> NormalizeParams(
+    private IReadOnlyList<ParameterNode> NormalizeParams(
         IReadOnlyList<ParameterNode> parameters) =>
         parameters.Count == 0
             ? parameters
             : parameters.Select(p => p with { TypeRef = NormalizeType(p.TypeRef) }).ToList();
 
-    private static IReadOnlyList<VariableDeclaratorNode> NormalizeDeclarators(
+    private IReadOnlyList<VariableDeclaratorNode> NormalizeDeclarators(
         IReadOnlyList<VariableDeclaratorNode> declarators) =>
         declarators.Count == 0
             ? declarators
