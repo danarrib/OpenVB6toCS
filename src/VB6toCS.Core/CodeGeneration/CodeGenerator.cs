@@ -24,6 +24,12 @@ public sealed class CodeGenerator
 
     private string _currentModuleName = "";
 
+    // Type scope for implicit-coercion detection.
+    // Module-level field types (populated once per module, never cleared).
+    private readonly Dictionary<string, string> _moduleFieldTypes = new(StringComparer.OrdinalIgnoreCase);
+    // Procedure-level types: parameters + locals (cleared on each procedure entry).
+    private readonly Dictionary<string, string> _procTypes = new(StringComparer.OrdinalIgnoreCase);
+
     private CodeGenerator(bool isStatic,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
         IReadOnlySet<string>? enumTypedFieldNames)
@@ -57,6 +63,15 @@ public sealed class CodeGenerator
     private void GenerateModule(ModuleNode module)
     {
         _currentModuleName = module.Name;
+
+        // Collect module-level field types for implicit-coercion detection in comparisons.
+        _moduleFieldTypes.Clear();
+        foreach (var member in module.Members)
+            if (member is FieldNode f)
+                foreach (var d in f.Declarators)
+                    if (d.TypeRef != null)
+                        _moduleFieldTypes[d.Name] = d.TypeRef.TypeName;
+
         string staticKw  = _isStatic ? "static " : "";
         string baseClause = module.Implements.Count > 0
             ? " : " + string.Join(", ", module.Implements)
@@ -143,6 +158,7 @@ public sealed class CodeGenerator
         string staticKw = _isStatic || s.IsStatic ? "static " : "";
         _w.WriteLine($"{Access(s.Access)}{staticKw}void {s.Name}({Params(s.Parameters)})");
         _w.OpenBrace();
+        EnterProcScope(s.Parameters);
         GenerateBody(s.Body, returnType: null);
         _w.CloseBrace();
     }
@@ -153,6 +169,7 @@ public sealed class CodeGenerator
         string returnType = TypeStr(f.ReturnType, f.Name);
         _w.WriteLine($"{Access(f.Access)}{staticKw}{returnType} {f.Name}({Params(f.Parameters)})");
         _w.OpenBrace();
+        EnterProcScope(f.Parameters);
         GenerateBodyWithReturn(f.Body, returnType);
         _w.CloseBrace();
     }
@@ -166,6 +183,7 @@ public sealed class CodeGenerator
 
         if (p.GetBody != null)
         {
+            EnterProcScope(p.GetParameters);
             _w.WriteLine("get");
             _w.OpenBrace();
             GenerateBodyWithReturn(p.GetBody, propType);
@@ -174,7 +192,7 @@ public sealed class CodeGenerator
 
         if (p.LetBody != null)
         {
-            // value parameter is the last parameter
+            EnterProcScope(p.LetParameters);
             string valueParam = p.LetParameters.Count > 0
                 ? p.LetParameters[^1].Name : "value";
             _w.WriteLine($"set  // Let — parameter: {valueParam}");
@@ -185,6 +203,7 @@ public sealed class CodeGenerator
 
         if (p.SetBody != null)
         {
+            EnterProcScope(p.SetParameters);
             string valueParam = p.SetParameters.Count > 0
                 ? p.SetParameters[^1].Name : "value";
             _w.WriteLine($"set  // Set — parameter: {valueParam}");
@@ -231,6 +250,7 @@ public sealed class CodeGenerator
             case LocalDimNode d:
                 foreach (var dec in d.Declarators)
                 {
+                    if (dec.TypeRef != null) _procTypes[dec.Name] = dec.TypeRef.TypeName;
                     string typeStr = TypeStr(dec.TypeRef, dec.Name);
                     string init    = dec.DefaultValue != null ? $" = {Expr(dec.DefaultValue)}" : "";
                     _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{ReviewComment(dec.TypeRef)}");
@@ -618,6 +638,48 @@ public sealed class CodeGenerator
         e is IdentifierNode id &&
         _enumMemberMap.ContainsKey(id.Name);
 
+    // ── Scope helpers ─────────────────────────────────────────────────────────
+
+    /// <summary>Resets procedure-level scope and populates it from the parameter list.</summary>
+    private void EnterProcScope(IReadOnlyList<ParameterNode> parameters)
+    {
+        _procTypes.Clear();
+        foreach (var p in parameters)
+            if (p.TypeRef != null)
+                _procTypes[p.Name] = p.TypeRef.TypeName;
+    }
+
+    /// <summary>
+    /// Returns the C# type name for simple expressions whose type can be determined
+    /// without cross-module resolution: literals and identifiers in the current scope.
+    /// Returns null when the type is unknown or complex (e.g. member-access chains).
+    /// </summary>
+    private string? TryGetSimpleType(ExpressionNode e) => e switch
+    {
+        StringLiteralNode    => "string",
+        IntegerLiteralNode   => "int",
+        DoubleLiteralNode    => "double",
+        BoolLiteralNode      => "bool",
+        IdentifierNode id    => _procTypes.TryGetValue(id.Name, out var t) ? t
+                              : _moduleFieldTypes.TryGetValue(id.Name, out t) ? t
+                              : null,
+        _                    => null,
+    };
+
+    private static bool IsNumericCsType(string? type) =>
+        type is "int" or "long" or "double" or "float" or "decimal" or "byte";
+
+    /// <summary>
+    /// Converts a numeric expression string to its string equivalent for use in
+    /// string comparisons. Literals are wrapped in quotes; variables get .ToString().
+    /// </summary>
+    private static string NumericToString(ExpressionNode node, string emitted) => node switch
+    {
+        IntegerLiteralNode i => $"\"{i.Value}\"",
+        DoubleLiteralNode  d => $"\"{d.RawText}\"",
+        _                    => $"{emitted}.ToString()",
+    };
+
     /// <summary>
     /// Returns true when the terminal member name of the expression is a field,
     /// property, or UDT field whose VB6 declared type is an enum type.
@@ -656,6 +718,16 @@ public sealed class CodeGenerator
         {
             if (IsEnumMember(b.Left)  && !IsEnumTypedField(b.Right)) left  = $"(int){left}";
             if (IsEnumMember(b.Right) && !IsEnumTypedField(b.Left))  right = $"(int){right}";
+
+            // VB6 also coerces between string and numeric types implicitly.
+            // In C# this is a compile error; convert the numeric side to string
+            // (safer than parsing the string, which may throw on non-numeric values).
+            string? leftType  = TryGetSimpleType(b.Left);
+            string? rightType = TryGetSimpleType(b.Right);
+            if (leftType == "string" && IsNumericCsType(rightType))
+                right = NumericToString(b.Right, right);
+            else if (rightType == "string" && IsNumericCsType(leftType))
+                left  = NumericToString(b.Left, left);
         }
 
         string op = b.Operator switch
