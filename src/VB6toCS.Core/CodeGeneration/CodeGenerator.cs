@@ -502,11 +502,14 @@ public sealed class CodeGenerator
 
     private string NewObjectExpr(NewObjectNode n)
     {
-        // VB6 "New Collection" → C# "new Collection<object>()"
+        // VB6 "New Collection" → C# "new()" (target-typed new, C# 9+).
+        // The element type is inferred by the compiler from the assignment target's
+        // declared type, which is already correctly set to Collection<T> or
+        // Collection<object> by the Transformer.
         if (n.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
         {
             _requiredUsings.Add("System.Collections.ObjectModel");
-            return "new Collection<object>()";
+            return "new()";
         }
         return $"new {n.TypeName}()";
     }
