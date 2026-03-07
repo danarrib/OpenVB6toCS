@@ -4,31 +4,49 @@ namespace VB6toCS.Core.Analysis;
 
 /// <summary>
 /// Cross-module inference pass that deduces the element type of VB6 Collection fields
-/// by scanning all .Add(item) call sites across the entire project.
+/// and properties by scanning all .Add(item) call sites and Set-assignment sites across
+/// the entire project, then propagating types transitively until stable.
 ///
-/// A Collection field is assigned a concrete element type when every observed Add call
-/// passes items of the same type.  If zero Add calls are found, or items of more than
-/// one type are added, the field is left unresolved (will become Collection&lt;object&gt;).
+/// Algorithm (runs on Stage-3 ASTs, before Transformer):
 ///
-/// Must run on Stage-3 ASTs (after Analyser, before Transformer).
+///   Pass 1 — Build member maps (field types + property return types per module).
+///   Pass 2 — Scan every .Add(item) call site; record (ownerModule, field) → elemType.
+///   Pass 3 — Initialise _resolvedTypes from unambiguous Add-scan results.
+///   Pass 4+ (loop) —
+///     a. Scan every AssignmentNode: if RHS is a resolved Collection, propagate its
+///        element type to the LHS Collection field/property.
+///     b. Scan every Property getter FunctionReturnNode: if the returned expression is
+///        a resolved Collection, record the property's return element type.
+///     Repeat until no new types are resolved.
+///
+/// A field/property is resolved to Collection&lt;object&gt; as fallback when inference fails.
 /// </summary>
 public sealed class CollectionTypeInferrer
 {
-    // module.Name → { fieldName (ci) → declared VB6 type name }
-    private readonly Dictionary<string, Dictionary<string, string>> _moduleFields =
+    // module.Name → { memberName (ci) → VB6 declared/return type }
+    // Includes both FieldNode declarators and CsPropertyNode getter return types.
+    private readonly Dictionary<string, Dictionary<string, string>> _moduleMembers =
         new(StringComparer.OrdinalIgnoreCase);
 
-    // (moduleName, fieldName) → distinct element type names observed at Add call sites
+    // (moduleName, memberName) → distinct element types observed at Add call sites only.
     private readonly Dictionary<(string, string), HashSet<string>> _hits = new();
+
+    // Working set of resolved Collection element types (fields + properties).
+    // Updated during both the Add scan and the propagation loop.
+    private readonly Dictionary<(string, string), string> _resolvedTypes =
+        new();
+
+    // Keys that received conflicting types from different sites — excluded from results.
+    private readonly HashSet<(string, string)> _conflicted = new();
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// <summary>Run the two-pass inference on all Stage-3 modules.</summary>
+    /// <summary>Run all inference passes on the full set of Stage-3 modules.</summary>
     public void Analyse(IEnumerable<ModuleNode> modules)
     {
         var list = modules.ToList();
 
-        // Pass 1: record every field's declared type for every module.
+        // Pass 1: build member maps (fields + property return types).
         foreach (var module in list)
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -36,38 +54,46 @@ public sealed class CollectionTypeInferrer
                 foreach (var d in f.Declarators)
                     if (d.TypeRef != null)
                         map[d.Name] = d.TypeRef.TypeName;
-            _moduleFields[module.Name] = map;
+            foreach (var p in module.Members.OfType<CsPropertyNode>())
+                if (p.Type?.TypeName != null)
+                    map[p.Name] = p.Type.TypeName;
+            _moduleMembers[module.Name] = map;
         }
 
-        // Pass 2: scan every procedure body for collection.Add(item) calls.
+        // Pass 2: scan Add call sites.
         foreach (var module in list)
             ScanModule(module);
-    }
 
-    /// <summary>
-    /// Returns a dictionary of all unambiguously inferred collection types.
-    /// Key: (moduleName, fieldName).  Value: element type name.
-    /// Only fields where every Add call agreed on a single type are included.
-    /// </summary>
-    public IReadOnlyDictionary<(string, string), string> GetInferredTypes()
-    {
-        var result = new Dictionary<(string, string), string>();
+        // Pass 3: seed _resolvedTypes from unambiguous Add-scan results.
         foreach (var (key, types) in _hits)
             if (types.Count == 1)
-                result[key] = types.First();
-        return result;
+                TryResolve(key, types.First(), out _);
+
+        // Pass 4+: propagation loop — assignment propagation + property return inference.
+        bool anyNew;
+        do
+        {
+            anyNew = false;
+            foreach (var module in list)
+                anyNew |= PropagateModule(module);
+        } while (anyNew);
     }
 
     /// <summary>
-    /// Returns the single inferred element type for the given Collection field,
-    /// or null when the type could not be unambiguously determined.
+    /// Returns a read-only snapshot of all resolved Collection element types after
+    /// inference is complete. Key: (moduleName, fieldOrPropertyName). Value: element type.
+    /// </summary>
+    public IReadOnlyDictionary<(string, string), string> GetInferredTypes() =>
+        _resolvedTypes;
+
+    /// <summary>
+    /// Returns the single inferred element type for a specific field/property,
+    /// or null if it could not be resolved.
     /// </summary>
     public string? GetElementType(string moduleName, string fieldName) =>
-        _hits.TryGetValue((moduleName, fieldName), out var types) && types.Count == 1
-            ? types.First()
-            : null;
+        _resolvedTypes.TryGetValue((moduleName, fieldName), out var t) ? t : null;
 
-    // ── Module / procedure scanning ───────────────────────────────────────────
+    // ── Add-call scanning (Pass 2) ────────────────────────────────────────────
 
     private void ScanModule(ModuleNode module)
     {
@@ -76,49 +102,30 @@ public sealed class CollectionTypeInferrer
             switch (member)
             {
                 case SubNode s:
-                    ScanProcedure(module.Name, s.Parameters, s.Body);
+                    ScanProcedureForAdds(module.Name, s.Parameters, s.Body);
                     break;
                 case FunctionNode f:
-                    ScanProcedure(module.Name, f.Parameters, f.Body);
+                    ScanProcedureForAdds(module.Name, f.Parameters, f.Body);
                     break;
                 case CsPropertyNode p:
-                    if (p.GetBody != null) ScanProcedure(module.Name, p.GetParameters, p.GetBody);
-                    if (p.LetBody != null) ScanProcedure(module.Name, p.LetParameters, p.LetBody);
-                    if (p.SetBody != null) ScanProcedure(module.Name, p.SetParameters, p.SetBody);
+                    if (p.GetBody != null) ScanProcedureForAdds(module.Name, p.GetParameters, p.GetBody);
+                    if (p.LetBody != null) ScanProcedureForAdds(module.Name, p.LetParameters, p.LetBody);
+                    if (p.SetBody != null) ScanProcedureForAdds(module.Name, p.SetParameters, p.SetBody);
                     break;
             }
         }
     }
 
-    private void ScanProcedure(
+    private void ScanProcedureForAdds(
         string moduleName,
         IReadOnlyList<ParameterNode> parameters,
         IReadOnlyList<AstNode> body)
     {
-        var locals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var p in parameters)
-            if (p.TypeRef != null)
-                locals[p.Name] = p.TypeRef.TypeName;
-        CollectLocals(body, locals);
-
-        ScanBody(body, moduleName, locals, new Stack<string?>());
+        var locals = BuildLocals(parameters, body);
+        ScanBodyForAdds(body, moduleName, locals, new Stack<string?>());
     }
 
-    private static void CollectLocals(IReadOnlyList<AstNode> body, Dictionary<string, string> locals)
-    {
-        foreach (var node in body)
-        {
-            if (node is LocalDimNode dim)
-                foreach (var d in dim.Declarators)
-                    if (d.TypeRef != null)
-                        locals[d.Name] = d.TypeRef.TypeName;
-
-            foreach (var child in ChildBodies(node))
-                CollectLocals(child, locals);
-        }
-    }
-
-    private void ScanBody(
+    private void ScanBodyForAdds(
         IReadOnlyList<AstNode> body,
         string moduleName,
         Dictionary<string, string> locals,
@@ -128,22 +135,19 @@ public sealed class CollectionTypeInferrer
         {
             RecordAddCall(node, moduleName, locals, withStack);
 
-            // WithNode is handled specially so we can push/pop the With type.
             if (node is WithNode w)
             {
-                withStack.Push(InferType(w.Object, moduleName, locals));
-                ScanBody(w.Body, moduleName, locals, withStack);
+                withStack.Push(InferMemberType(w.Object, moduleName, locals));
+                ScanBodyForAdds(w.Body, moduleName, locals, withStack);
                 withStack.Pop();
             }
             else
             {
                 foreach (var child in ChildBodies(node))
-                    ScanBody(child, moduleName, locals, withStack);
+                    ScanBodyForAdds(child, moduleName, locals, withStack);
             }
         }
     }
-
-    // ── Add-call detection ────────────────────────────────────────────────────
 
     private void RecordAddCall(
         AstNode node,
@@ -153,32 +157,30 @@ public sealed class CollectionTypeInferrer
     {
         if (node is not CallStatementNode call) return;
 
-        // Two representations depending on whether parens were used in VB6:
-        //   col.Add item      → CallStatement { Target=MemberAccess(col,"Add"), Args=[item] }
-        //   col.Add(item)     → CallStatement { Target=CallOrIndex(MemberAccess(col,"Add"),[item]), Args=[] }
+        // col.Add item      → Target=MemberAccess(col,"Add"), Args=[item]
+        // col.Add(item)     → Target=CallOrIndex(MemberAccess(col,"Add"),[item]), Args=[]
         MemberAccessNode? addMa;
         IReadOnlyList<ArgumentNode> addArgs;
 
         if (call.Target is MemberAccessNode ma1 &&
             ma1.MemberName.Equals("Add", StringComparison.OrdinalIgnoreCase))
         {
-            addMa = ma1;
-            addArgs = call.Arguments;
+            addMa = ma1;  addArgs = call.Arguments;
         }
         else if (call.Target is CallOrIndexNode coi &&
                  coi.Target is MemberAccessNode ma2 &&
                  ma2.MemberName.Equals("Add", StringComparison.OrdinalIgnoreCase))
         {
-            addMa = ma2;
-            addArgs = coi.Arguments;
+            addMa = ma2;  addArgs = coi.Arguments;
         }
         else return;
 
-        // First non-missing argument is the item being added to the collection.
+        // First non-missing argument is the item being added.
+        // For named args like "Item:=x", the first arg still carries the value.
         var itemArg = addArgs.FirstOrDefault(a => !a.IsMissing);
         if (itemArg?.Value == null) return;
 
-        string? elemType = InferType(itemArg.Value, moduleName, locals);
+        string? elemType = InferMemberType(itemArg.Value, moduleName, locals);
         if (elemType == null) return;
 
         var target = ResolveCollectionTarget(addMa.Object, moduleName, locals, withStack);
@@ -190,13 +192,125 @@ public sealed class CollectionTypeInferrer
         set.Add(elemType);
     }
 
-    // ── Type / target resolution ──────────────────────────────────────────────
+    // ── Propagation (Pass 4+) ─────────────────────────────────────────────────
+
+    private bool PropagateModule(ModuleNode module)
+    {
+        bool anyNew = false;
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case SubNode s:
+                    anyNew |= PropagateBody(
+                        s.Body, module.Name,
+                        BuildLocals(s.Parameters, s.Body),
+                        new Stack<string?>(), returnKey: null);
+                    break;
+
+                case FunctionNode f:
+                    anyNew |= PropagateBody(
+                        f.Body, module.Name,
+                        BuildLocals(f.Parameters, f.Body),
+                        new Stack<string?>(), returnKey: null);
+                    break;
+
+                case CsPropertyNode p:
+                    // Getter: propagate return type as well as assignments inside.
+                    if (p.GetBody != null)
+                    {
+                        var getLocals = BuildLocals(p.GetParameters, p.GetBody);
+                        anyNew |= PropagateBody(
+                            p.GetBody, module.Name, getLocals,
+                            new Stack<string?>(),
+                            returnKey: (module.Name, p.Name));
+                    }
+                    if (p.LetBody != null)
+                        anyNew |= PropagateBody(
+                            p.LetBody, module.Name,
+                            BuildLocals(p.LetParameters, p.LetBody),
+                            new Stack<string?>(), returnKey: null);
+                    if (p.SetBody != null)
+                        anyNew |= PropagateBody(
+                            p.SetBody, module.Name,
+                            BuildLocals(p.SetParameters, p.SetBody),
+                            new Stack<string?>(), returnKey: null);
+                    break;
+            }
+        }
+        return anyNew;
+    }
+
+    private bool PropagateBody(
+        IReadOnlyList<AstNode> body,
+        string moduleName,
+        Dictionary<string, string> locals,
+        Stack<string?> withStack,
+        (string, string)? returnKey)
+    {
+        bool anyNew = false;
+        foreach (var node in body)
+        {
+            anyNew |= TryPropagateStatement(node, moduleName, locals, withStack, returnKey);
+
+            if (node is WithNode w)
+            {
+                withStack.Push(InferMemberType(w.Object, moduleName, locals));
+                anyNew |= PropagateBody(w.Body, moduleName, locals, withStack, returnKey);
+                withStack.Pop();
+            }
+            else
+            {
+                foreach (var child in ChildBodies(node))
+                    anyNew |= PropagateBody(child, moduleName, locals, withStack, returnKey);
+            }
+        }
+        return anyNew;
+    }
+
+    private bool TryPropagateStatement(
+        AstNode node,
+        string moduleName,
+        Dictionary<string, string> locals,
+        Stack<string?> withStack,
+        (string, string)? returnKey)
+    {
+        // ── Assignment: X = Y where Y is a resolved Collection ────────────────
+        if (node is AssignmentNode a)
+        {
+            string? elemType = InferCollectionElementType(a.Value, moduleName, locals, withStack);
+            if (elemType != null)
+            {
+                var target = ResolveCollectionTarget(a.Target, moduleName, locals, withStack);
+                if (target != null)
+                {
+                    TryResolve(target.Value, elemType, out bool changed);
+                    return changed;
+                }
+            }
+        }
+
+        // ── Property getter return: FunctionReturnNode → infer property type ──
+        if (node is FunctionReturnNode ret && returnKey != null)
+        {
+            string? elemType = InferCollectionElementType(ret.Value, moduleName, locals, withStack);
+            if (elemType != null)
+            {
+                TryResolve(returnKey.Value, elemType, out bool changed);
+                return changed;
+            }
+        }
+
+        return false;
+    }
+
+    // ── Shared resolution helpers ─────────────────────────────────────────────
 
     /// <summary>
-    /// Resolves the collection variable being written to as (ownerModuleName, fieldName).
-    /// Returns null when the target is not a recognisable Collection field reference.
+    /// Resolves the collection being targeted (field or property) as (ownerModule, name).
+    /// Returns null when the target is not a recognisable unresolved Collection reference.
     /// </summary>
-    private (string mod, string field)? ResolveCollectionTarget(
+    private (string mod, string name)? ResolveCollectionTarget(
         ExpressionNode target,
         string moduleName,
         Dictionary<string, string> locals,
@@ -204,47 +318,78 @@ public sealed class CollectionTypeInferrer
     {
         switch (target)
         {
-            // colField.Add ... — direct module-level field in the current class
             case IdentifierNode id:
-                if (_moduleFields.TryGetValue(moduleName, out var mf) &&
+                if (_moduleMembers.TryGetValue(moduleName, out var mf) &&
                     mf.TryGetValue(id.Name, out var type) &&
                     type.Equals("Collection", StringComparison.OrdinalIgnoreCase))
                     return (moduleName, id.Name);
                 break;
 
-            // .colField.Add ... — field on the current With object
             case WithMemberAccessNode wma:
             {
                 string? withType = withStack.Count > 0 ? withStack.Peek() : null;
                 if (withType != null &&
-                    _moduleFields.TryGetValue(withType, out var withFields) &&
-                    withFields.TryGetValue(wma.MemberName, out var fieldType) &&
-                    fieldType.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+                    _moduleMembers.TryGetValue(withType, out var wf) &&
+                    wf.TryGetValue(wma.MemberName, out var ft) &&
+                    ft.Equals("Collection", StringComparison.OrdinalIgnoreCase))
                     return (withType, wma.MemberName);
                 break;
             }
 
-            // obj.colField.Add ... — field belonging to another class
             case MemberAccessNode ma:
             {
-                string? ownerType = InferType(ma.Object, moduleName, locals);
+                string? ownerType = InferMemberType(ma.Object, moduleName, locals);
                 if (ownerType != null &&
-                    _moduleFields.TryGetValue(ownerType, out var ownerFields) &&
-                    ownerFields.TryGetValue(ma.MemberName, out var fieldType) &&
-                    fieldType.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+                    _moduleMembers.TryGetValue(ownerType, out var of) &&
+                    of.TryGetValue(ma.MemberName, out var ft) &&
+                    ft.Equals("Collection", StringComparison.OrdinalIgnoreCase))
                     return (ownerType, ma.MemberName);
                 break;
             }
         }
-
         return null;
     }
 
     /// <summary>
-    /// Best-effort type name for an expression.
+    /// Returns the Collection element type of an expression if it is already resolved,
+    /// or null when the element type is unknown.
+    /// </summary>
+    private string? InferCollectionElementType(
+        ExpressionNode expr,
+        string moduleName,
+        Dictionary<string, string> locals,
+        Stack<string?> withStack)
+    {
+        switch (expr)
+        {
+            case IdentifierNode id:
+                if (_resolvedTypes.TryGetValue((moduleName, id.Name), out var t1)) return t1;
+                break;
+
+            case WithMemberAccessNode wma:
+            {
+                string? withType = withStack.Count > 0 ? withStack.Peek() : null;
+                if (withType != null &&
+                    _resolvedTypes.TryGetValue((withType, wma.MemberName), out var t2)) return t2;
+                break;
+            }
+
+            case MemberAccessNode ma:
+            {
+                string? ownerType = InferMemberType(ma.Object, moduleName, locals);
+                if (ownerType != null &&
+                    _resolvedTypes.TryGetValue((ownerType, ma.MemberName), out var t3)) return t3;
+                break;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Best-effort VB6 type name for an expression (used to resolve member owners).
     /// Returns null when the type cannot be statically determined.
     /// </summary>
-    private string? InferType(
+    private string? InferMemberType(
         ExpressionNode expr,
         string moduleName,
         Dictionary<string, string> locals)
@@ -256,7 +401,7 @@ public sealed class CollectionTypeInferrer
 
             case IdentifierNode id:
                 if (locals.TryGetValue(id.Name, out var lt)) return lt;
-                if (_moduleFields.TryGetValue(moduleName, out var mf) &&
+                if (_moduleMembers.TryGetValue(moduleName, out var mf) &&
                     mf.TryGetValue(id.Name, out var ft)) return ft;
                 return null;
 
@@ -265,17 +410,76 @@ public sealed class CollectionTypeInferrer
 
             case MemberAccessNode ma:
             {
-                // One level of member access: obj.TypedField
-                string? ownerType = InferType(ma.Object, moduleName, locals);
+                string? ownerType = InferMemberType(ma.Object, moduleName, locals);
                 if (ownerType != null &&
-                    _moduleFields.TryGetValue(ownerType, out var ownerFields) &&
-                    ownerFields.TryGetValue(ma.MemberName, out var memberType))
+                    _moduleMembers.TryGetValue(ownerType, out var of) &&
+                    of.TryGetValue(ma.MemberName, out var memberType))
                     return memberType;
                 return null;
             }
 
             default:
                 return null;
+        }
+    }
+
+    // ── Resolution bookkeeping ────────────────────────────────────────────────
+
+    /// <summary>
+    /// Attempts to record elemType for key.
+    /// If key was already resolved to the same type: no-op.
+    /// If key was already resolved to a different type: marks as conflicted (removed).
+    /// Sets changed=true only when the resolution set actually changes.
+    /// </summary>
+    private void TryResolve((string, string) key, string elemType, out bool changed)
+    {
+        if (_conflicted.Contains(key)) { changed = false; return; }
+
+        if (_resolvedTypes.TryGetValue(key, out var existing))
+        {
+            if (existing.Equals(elemType, StringComparison.OrdinalIgnoreCase))
+            {
+                changed = false;
+            }
+            else
+            {
+                // Conflict: two different types → demote to unresolved.
+                _resolvedTypes.Remove(key);
+                _conflicted.Add(key);
+                changed = true;
+            }
+        }
+        else
+        {
+            _resolvedTypes[key] = elemType;
+            changed = true;
+        }
+    }
+
+    // ── Local variable map builder ────────────────────────────────────────────
+
+    private static Dictionary<string, string> BuildLocals(
+        IReadOnlyList<ParameterNode> parameters,
+        IReadOnlyList<AstNode> body)
+    {
+        var locals = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in parameters)
+            if (p.TypeRef != null)
+                locals[p.Name] = p.TypeRef.TypeName;
+        CollectLocals(body, locals);
+        return locals;
+    }
+
+    private static void CollectLocals(IReadOnlyList<AstNode> body, Dictionary<string, string> locals)
+    {
+        foreach (var node in body)
+        {
+            if (node is LocalDimNode dim)
+                foreach (var d in dim.Declarators)
+                    if (d.TypeRef != null)
+                        locals[d.Name] = d.TypeRef.TypeName;
+            foreach (var child in ChildBodies(node))
+                CollectLocals(child, locals);
         }
     }
 
@@ -301,7 +505,7 @@ public sealed class CollectionTypeInferrer
             case ForEachNode  f: yield return f.Body; break;
             case WhileNode    w: yield return w.Body; break;
             case DoLoopNode   d: yield return d.Body; break;
-            // WithNode is handled directly in ScanBody (push/pop stack); omitted here.
+            // WithNode is handled directly in ScanBodyForAdds / PropagateBody (push/pop stack).
         }
     }
 }
