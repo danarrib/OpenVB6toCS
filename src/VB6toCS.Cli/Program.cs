@@ -1,4 +1,5 @@
 using VB6toCS.Core.Analysis;
+using VB6toCS.Core.CodeGeneration;
 using VB6toCS.Core.Lexing;
 using VB6toCS.Core.Parsing;
 using VB6toCS.Core.Parsing.Nodes;
@@ -184,17 +185,15 @@ static int RunProject(string vbpPath, CliOptions options)
 
     foreach (var (src, module) in parsed)
     {
+        bool isStatic = src.Kind == VbSourceKind.StaticModule;
+        string csCode = CodeGenerator.Generate(module, isStatic);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
-        File.WriteAllText(csFile,
-            $"// TODO: code generation not yet implemented\n" +
-            $"// Source: {Path.GetFileName(src.FullPath)}\n" +
-            $"// Module: {module.Name} [{module.Kind}]\n");
-        Console.WriteLine($"Written  : {module.Name}.cs  (placeholder)");
+        File.WriteAllText(csFile, csCode);
+        Console.WriteLine($"Written  : {module.Name}.cs");
     }
 
     Console.WriteLine();
-    Console.WriteLine($"Done. {parsed.Count} file(s) parsed successfully.");
-    Console.WriteLine("Note: C# code generation is not yet implemented — .cs files are placeholders.");
+    Console.WriteLine($"Done. {parsed.Count} file(s) translated.");
     if (options.UpToStage == 6)
         Console.WriteLine("Note: Roslyn formatting (stage 6) is not yet implemented.");
 
