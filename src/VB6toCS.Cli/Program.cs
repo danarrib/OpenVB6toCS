@@ -82,7 +82,7 @@ static int RunProject(string vbpPath, CliOptions options)
             continue;
         }
 
-        string source = File.ReadAllText(src.FullPath);
+        string source = File.ReadAllText(src.FullPath, System.Text.Encoding.Latin1);
 
         // Stage 1: tokenize
         List<Token> tokens;
@@ -188,7 +188,7 @@ static int RunProject(string vbpPath, CliOptions options)
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
         string csCode = CodeGenerator.Generate(module, isStatic);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
-        File.WriteAllText(csFile, csCode);
+        File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
     }
 
@@ -204,7 +204,7 @@ static int RunProject(string vbpPath, CliOptions options)
 
 static int RunSingleFile(string path, CliOptions options)
 {
-    string source = File.ReadAllText(path);
+    string source = File.ReadAllText(path, System.Text.Encoding.Latin1);
 
     List<Token> tokens;
     try
