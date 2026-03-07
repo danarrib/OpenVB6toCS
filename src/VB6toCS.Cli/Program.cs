@@ -3,32 +3,43 @@ using VB6toCS.Core.Parsing;
 using VB6toCS.Core.Parsing.Nodes;
 using VB6toCS.Core.Projects;
 
+// ── Argument parsing ────────────────────────────────────────────────────────
+
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("Usage: vb6tocs <file.vbp|file.cls|file.bas>");
+    Console.Error.WriteLine(CliOptions.UsageText);
     return 1;
 }
 
-var path = Path.GetFullPath(args[0]);
+var (options, parseError) = CliOptions.Parse(args);
+if (options == null)
+{
+    Console.Error.WriteLine($"Error: {parseError}");
+    Console.Error.WriteLine();
+    Console.Error.WriteLine(CliOptions.UsageText);
+    return 1;
+}
+
+var path = Path.GetFullPath(options.InputPath);
 if (!File.Exists(path))
 {
-    Console.Error.WriteLine($"File not found: {path}");
+    Console.Error.WriteLine($"Error: File not found: {path}");
     return 1;
 }
 
 string ext = Path.GetExtension(path).ToLowerInvariant();
-
 return ext switch
 {
-    ".vbp" => RunProject(path),
-    ".cls" or ".bas" => RunSingleFile(path),
-    _ => Error($"Unsupported file type '{ext}'. Pass a .vbp, .cls, or .bas file.")
+    ".vbp"        => RunProject(path, options),
+    ".cls" or ".bas" => RunSingleFile(path, options),
+    _ => PrintError($"Unsupported file type '{ext}'. Pass a .vbp, .cls, or .bas file.")
 };
 
-// ── Project mode ───────────────────────────────────────────────────────────
+// ── Project mode ────────────────────────────────────────────────────────────
 
-static int RunProject(string vbpPath)
+static int RunProject(string vbpPath, CliOptions options)
 {
+    // Stage 0: read VBP project file
     VbProject project;
     try
     {
@@ -36,54 +47,67 @@ static int RunProject(string vbpPath)
     }
     catch (Exception ex)
     {
-        return Error($"Failed to read project file: {ex.Message}");
+        return PrintError($"Failed to read project file: {ex.Message}");
     }
 
-    string outputDir = Path.Combine(Path.GetDirectoryName(vbpPath)!, project.Name);
+    PrintProjectHeader(project, options);
 
-    Console.WriteLine($"Project : {project.Name}");
-    Console.WriteLine($"Source  : {vbpPath}");
-    Console.WriteLine($"Output  : {outputDir}");
-    Console.WriteLine();
-
-    // Report COM references
-    if (project.ComReferences.Count > 0)
+    // Stage 0: list files and stop
+    if (options.UpToStage == 0)
     {
-        Console.WriteLine($"COM references ({project.ComReferences.Count}):");
-        foreach (var r in project.ComReferences)
-            Console.WriteLine($"  {r.Description}  [v{r.VersionMajor}.{r.VersionMinor}]");
+        Console.WriteLine($"Source files ({project.SourceFiles.Count}):");
+        foreach (var src in project.SourceFiles)
+            Console.WriteLine($"  {src.Name}  ({Path.GetFileName(src.FullPath)})  [{src.Kind}]");
         Console.WriteLine();
+        Console.WriteLine($"{project.SourceFiles.Count} file(s) listed. Stage 0 — no further processing.");
+        return 0;
     }
 
-    // Report skipped files
-    if (project.SkippedFiles.Count > 0)
-    {
-        Console.WriteLine($"Skipped ({project.SkippedFiles.Count} — out of scope):");
-        foreach (var s in project.SkippedFiles)
-            Console.WriteLine($"  {s.Name}  — {s.Reason}");
-        Console.WriteLine();
-    }
-
-    // Parse each in-scope source file
-    Console.WriteLine($"Source files ({project.SourceFiles.Count}):");
+    // Stages 1+: process each source file through the pipeline
     int errors = 0;
-    var parsed = new List<(VbSourceFile File, ModuleNode Module)>();
+    int ok = 0;
+    var parsed = new List<(VbSourceFile Src, ModuleNode Module)>();
+
+    Console.WriteLine($"Source files ({project.SourceFiles.Count}):");
 
     foreach (var src in project.SourceFiles)
     {
         if (!File.Exists(src.FullPath))
         {
-            Console.WriteLine($"  [MISSING ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
+            Console.WriteLine($"  [MISSING ] {src.Name}  — {src.FullPath}");
             errors++;
             continue;
         }
 
+        string source = File.ReadAllText(src.FullPath);
+
+        // Stage 1: tokenize
+        List<Token> tokens;
         try
         {
-            var tokens = new Lexer(File.ReadAllText(src.FullPath)).Tokenize();
+            tokens = new Lexer(source).Tokenize();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  [ERROR   ] {src.Name}  — Lex error: {ex.Message}");
+            errors++;
+            continue;
+        }
+
+        if (options.UpToStage == 1)
+        {
+            Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)}) — {tokens.Count} tokens");
+            ok++;
+            continue;
+        }
+
+        // Stage 2+: validate Option Explicit and parse
+        try
+        {
             TokenListValidator.RequireOptionExplicit(tokens, src.FullPath);
             var module = new Parser(tokens, src.FullPath).Parse();
             parsed.Add((src, module));
+            ok++;
             Console.WriteLine($"  [OK      ] {src.Name}  ({Path.GetFileName(src.FullPath)})");
         }
         catch (VB6SourceException ex)
@@ -106,14 +130,29 @@ static int RunProject(string vbpPath)
         return 1;
     }
 
-    // Write output
+    // Stage 1–2: diagnostic only, no output files
+    if (options.UpToStage <= 2)
+    {
+        Console.WriteLine($"Stage {options.UpToStage} complete. {ok} file(s) processed. No output written.");
+        return 0;
+    }
+
+    // Stages 3–4: not yet implemented
+    if (options.UpToStage <= 4)
+    {
+        string stageName = options.UpToStage == 3 ? "Semantic analysis" : "IR transformation";
+        Console.WriteLine($"Stage {options.UpToStage} ({stageName}) is not yet implemented.");
+        Console.WriteLine($"Pipeline stopped after stage 2. {ok} file(s) parsed. No output written.");
+        return 0;
+    }
+
+    // Stages 5–6: write output
+    string outputDir = Path.Combine(Path.GetDirectoryName(vbpPath)!, project.Name);
     Directory.CreateDirectory(outputDir);
 
-    // Write .csproj
-    CsprojWriter.Write(project, outputDir);
+    CsprojWriter.Write(project, outputDir, options.NoInterop);
     Console.WriteLine($"Written  : {project.Name}.csproj");
 
-    // Placeholder .cs files (code generation not yet implemented)
     foreach (var (src, module) in parsed)
     {
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
@@ -126,31 +165,61 @@ static int RunProject(string vbpPath)
 
     Console.WriteLine();
     Console.WriteLine($"Done. {parsed.Count} file(s) parsed successfully.");
-    Console.WriteLine($"Note: C# code generation is not yet implemented — .cs files are placeholders.");
+    Console.WriteLine("Note: C# code generation is not yet implemented — .cs files are placeholders.");
+    if (options.UpToStage == 6)
+        Console.WriteLine("Note: Roslyn formatting (stage 6) is not yet implemented.");
+
     return 0;
 }
 
-// ── Single-file diagnostic mode ────────────────────────────────────────────
+// ── Single-file diagnostic mode ─────────────────────────────────────────────
 
-static int RunSingleFile(string path)
+static int RunSingleFile(string path, CliOptions options)
 {
-    var source = File.ReadAllText(path);
-    var tokens = new Lexer(source).Tokenize();
+    string source = File.ReadAllText(path);
 
+    List<Token> tokens;
+    try
+    {
+        tokens = new Lexer(source).Tokenize();
+    }
+    catch (Exception ex)
+    {
+        return PrintError($"Lex error: {ex.Message}");
+    }
+
+    // Stage 0 or 1: print token table
+    if (options.UpToStage <= 1)
+    {
+        Console.WriteLine($"Tokenizing: {path}");
+        Console.WriteLine(new string('-', 72));
+        Console.WriteLine($"{"Line",-6} {"Col",-6} {"Kind",-28} Text");
+        Console.WriteLine(new string('-', 72));
+        foreach (var t in tokens.Where(t => t.Kind != TokenKind.EndOfFile))
+        {
+            string text = t.Kind == TokenKind.Newline
+                ? "<newline>"
+                : t.Text.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+            Console.WriteLine($"{t.Line,-6} {t.Column,-6} {t.Kind,-28} {text}");
+        }
+        Console.WriteLine(new string('-', 72));
+        Console.WriteLine($"{tokens.Count} tokens.");
+        return 0;
+    }
+
+    // Stage 2+: validate and parse
     try
     {
         TokenListValidator.RequireOptionExplicit(tokens, path);
     }
     catch (VB6SourceException ex)
     {
-        return Error(ex.Message);
+        return PrintError(ex.Message);
     }
 
     try
     {
-        var parser = new Parser(tokens, path);
-        var module = parser.Parse();
-
+        var module = new Parser(tokens, path).Parse();
         Console.WriteLine($"Parsing: {path}");
         Console.WriteLine(new string('-', 60));
         AstPrinter.Print(module, Console.Out);
@@ -159,15 +228,43 @@ static int RunSingleFile(string path)
     }
     catch (ParseException ex)
     {
-        return Error($"Parse error: {ex.Message}");
+        return PrintError($"Parse error: {ex.Message}");
     }
 
     return 0;
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-static int Error(string message)
+static void PrintProjectHeader(VbProject project, CliOptions options)
+{
+    Console.WriteLine($"Project : {project.Name}");
+    Console.WriteLine($"Source  : {project.VbpPath}");
+    if (options.UpToStage >= 5)
+        Console.WriteLine($"Output  : {Path.Combine(project.VbpDirectory, project.Name)}");
+    Console.WriteLine();
+
+    if (options.NoInterop)
+        Console.WriteLine("Note: -NoInterop — COM references omitted from .csproj; TODO comments emitted at usage sites.");
+
+    if (project.ComReferences.Count > 0)
+    {
+        Console.WriteLine($"COM references ({project.ComReferences.Count}):");
+        foreach (var r in project.ComReferences)
+            Console.WriteLine($"  {r.Description}  [v{r.VersionMajor}.{r.VersionMinor}]");
+        Console.WriteLine();
+    }
+
+    if (project.SkippedFiles.Count > 0)
+    {
+        Console.WriteLine($"Skipped ({project.SkippedFiles.Count} — out of scope):");
+        foreach (var s in project.SkippedFiles)
+            Console.WriteLine($"  {s.Name}  — {s.Reason}");
+        Console.WriteLine();
+    }
+}
+
+static int PrintError(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
     return 1;

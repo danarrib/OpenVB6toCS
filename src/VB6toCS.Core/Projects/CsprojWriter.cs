@@ -5,14 +5,15 @@ namespace VB6toCS.Core.Projects;
 /// </summary>
 public static class CsprojWriter
 {
-    public static void Write(VbProject project, string outputDir)
+    public static void Write(VbProject project, string outputDir, bool noInterop = false)
     {
         // Determine which COM libraries need <COMReference> entries.
         // Known full-mapping libraries are excluded — their types are translated
         // to native .NET and no interop assembly is needed.
-        var interopRefs = project.ComReferences
-            .Where(r => !IsFullyMapped(r))
-            .ToList();
+        // When noInterop is set, all <COMReference> entries are suppressed entirely.
+        var interopRefs = noInterop
+            ? []
+            : project.ComReferences.Where(r => !IsFullyMapped(r)).ToList();
 
         string csprojPath = Path.Combine(outputDir, project.Name + ".csproj");
         using var w = new StreamWriter(csprojPath);
