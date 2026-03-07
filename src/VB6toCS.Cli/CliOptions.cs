@@ -2,7 +2,8 @@
 public sealed record CliOptions(
     string InputPath,
     bool NoInterop,
-    int UpToStage)
+    int UpToStage,
+    string? EncodingName)
 {
     public const int MaxStage = 6;
 
@@ -11,6 +12,7 @@ public sealed record CliOptions(
         string? inputPath = null;
         bool noInterop = false;
         int upToStage = MaxStage;
+        string? encodingName = null;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -30,6 +32,13 @@ public sealed record CliOptions(
 
                 upToStage = stage;
             }
+            else if (arg.Equals("-Encoding", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 >= args.Length)
+                    return (null, "-Encoding requires a value (e.g. windows-1252, utf-8, shift_jis).");
+
+                encodingName = args[++i];
+            }
             else if (arg.StartsWith('-'))
             {
                 return (null, $"Unknown option '{arg}'.");
@@ -47,7 +56,7 @@ public sealed record CliOptions(
         if (inputPath == null)
             return (null, "No input file specified.");
 
-        return (new CliOptions(inputPath, noInterop, upToStage), null);
+        return (new CliOptions(inputPath, noInterop, upToStage, encodingName), null);
     }
 
     public static string UsageText => $"""
@@ -63,9 +72,14 @@ public sealed record CliOptions(
                               0 — Parse .vbp and list source files
                               1 — Tokenize (lex) each file
                               2 — Parse each file into an AST
-                              3 — Semantic analysis        (not yet implemented)
-                              4 — IR transformation        (not yet implemented)
-                              5 — C# code generation       (writes placeholders for now)
+                              3 — Semantic analysis
+                              4 — IR transformation
+                              5 — C# code generation
                               6 — Roslyn formatting        (not yet implemented)
+
+          -Encoding <name>    Encoding used to read VB6 source files (default: windows-1252,
+                              falling back to Latin-1 if unavailable on this platform).
+                              Examples: utf-8, shift_jis, windows-1251, gb2312.
+                              Use any name accepted by System.Text.Encoding.GetEncoding().
         """;
 }

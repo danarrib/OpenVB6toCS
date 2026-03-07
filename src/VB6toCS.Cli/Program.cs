@@ -42,6 +42,7 @@ return ext switch
 
 static int RunProject(string vbpPath, CliOptions options)
 {
+    var sourceEncoding = ResolveEncoding(options.EncodingName);
     // Stage 0: read VBP project file
     VbProject project;
     try
@@ -82,7 +83,7 @@ static int RunProject(string vbpPath, CliOptions options)
             continue;
         }
 
-        string source = File.ReadAllText(src.FullPath, System.Text.Encoding.Latin1);
+        string source = File.ReadAllText(src.FullPath, sourceEncoding);
 
         // Stage 1: tokenize
         List<Token> tokens;
@@ -204,7 +205,8 @@ static int RunProject(string vbpPath, CliOptions options)
 
 static int RunSingleFile(string path, CliOptions options)
 {
-    string source = File.ReadAllText(path, System.Text.Encoding.Latin1);
+    var sourceEncoding = ResolveEncoding(options.EncodingName);
+    string source = File.ReadAllText(path, sourceEncoding);
 
     List<Token> tokens;
     try
@@ -313,4 +315,38 @@ static int PrintError(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
     return 1;
+}
+
+/// <summary>
+/// Resolves the encoding to use for reading VB6 source files.
+/// Priority: user-specified → windows-1252 (if available) → Latin-1 fallback.
+/// </summary>
+static System.Text.Encoding ResolveEncoding(string? name)
+{
+    if (name != null)
+    {
+        try
+        {
+            System.Text.Encoding.RegisterProvider(
+                System.Text.CodePagesEncodingProvider.Instance);
+            return System.Text.Encoding.GetEncoding(name);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Warning: Unknown encoding '{name}': {ex.Message}. Falling back to Latin-1.");
+            return System.Text.Encoding.Latin1;
+        }
+    }
+
+    // Try windows-1252 (requires the code pages provider on non-Windows platforms)
+    try
+    {
+        System.Text.Encoding.RegisterProvider(
+            System.Text.CodePagesEncodingProvider.Instance);
+        return System.Text.Encoding.GetEncoding(1252);
+    }
+    catch
+    {
+        return System.Text.Encoding.Latin1;
+    }
 }
