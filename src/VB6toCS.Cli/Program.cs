@@ -210,6 +210,12 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
+    // ── Set of field names (module fields + UDT fields) whose type is Dictionary<…> ─
+    // Built from Stage-4 modules so types are already normalised by the Transformer.
+    // Used by the code generator to append .Values when iterating over a Dictionary
+    // that is accessed as a member (e.g. obj.ColecaoPedCobert → needs .Values).
+    var dictionaryTypedFieldNames = BuildDictionaryTypedFieldNames(parsed.Select(p => p.Module));
+
     // Stages 5–6: write output
     string outputDir = Path.Combine(Path.GetDirectoryName(vbpPath)!, project.Name);
     Directory.CreateDirectory(outputDir);
@@ -220,7 +226,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -479,6 +485,57 @@ static IReadOnlySet<string> BuildEnumTypedFieldNames(
 
     return result;
 }
+
+/// <summary>
+/// Builds a set of field names (module-level fields, properties, and UDT fields) whose
+/// normalised C# type is a <c>Dictionary&lt;…&gt;</c>.
+/// Built from Stage-4 modules (after Transformer normalises Collection → Dictionary).
+/// Used by the code generator to append <c>.Values</c> when a For Each iterates over a
+/// Dictionary accessed as a member (e.g. <c>obj.ColecaoPedCobert</c>).
+/// A name is included only if it is NEVER declared with a non-Dictionary type anywhere in
+/// the project (avoids false positives for field names shared across different types).
+/// </summary>
+static IReadOnlySet<string> BuildDictionaryTypedFieldNames(IEnumerable<ModuleNode> modules)
+{
+    var result  = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var nonDict = new HashSet<string>(StringComparer.OrdinalIgnoreCase); // conflict tracker
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case FieldNode f:
+                    foreach (var d in f.Declarators)
+                    {
+                        if (IsDictionaryType(d.TypeRef?.TypeName)) result.Add(d.Name);
+                        else if (d.TypeRef != null) nonDict.Add(d.Name);
+                    }
+                    break;
+
+                case CsPropertyNode p:
+                    if (IsDictionaryType(p.Type?.TypeName)) result.Add(p.Name);
+                    else if (p.Type != null) nonDict.Add(p.Name);
+                    break;
+
+                case UdtNode u:
+                    foreach (var fld in u.Fields)
+                    {
+                        if (IsDictionaryType(fld.TypeRef.TypeName)) result.Add(fld.Name);
+                        else nonDict.Add(fld.Name);
+                    }
+                    break;
+            }
+        }
+    }
+
+    result.ExceptWith(nonDict); // remove names that appear with non-Dictionary types anywhere
+    return result;
+}
+
+static bool IsDictionaryType(string? typeName) =>
+    typeName != null && typeName.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase);
 
 /// <summary>
 /// Builds a cross-module enum member map from all Stage-3 ASTs.

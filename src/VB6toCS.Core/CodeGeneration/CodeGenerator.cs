@@ -22,6 +22,11 @@ public sealed class CodeGenerator
     // Used to suppress the (int) cast when both sides of a comparison are enum-typed.
     private readonly IReadOnlySet<string>? _enumTypedFieldNames;
 
+    // Set of field/UDT-field names (project-wide) whose normalised type is Dictionary<…>.
+    // Built from Stage-4 modules. Used by ForEachNode to append .Values when iterating over a
+    // Dictionary accessed as a member (TryGetSimpleType returns null for member-access chains).
+    private readonly IReadOnlySet<string>? _dictionaryTypedFieldNames;
+
     // Cross-module default member map: className → defaultMemberName (VB_UserMemId = 0).
     // Used to expand VB6 default member calls: obj(arg) → obj.DefaultMember(arg).
     private readonly IReadOnlyDictionary<string, string>? _defaultMemberMap;
@@ -64,7 +69,8 @@ public sealed class CodeGenerator
         IReadOnlySet<string>? enumTypedFieldNames,
         IReadOnlyDictionary<string, string>? defaultMemberMap,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap,
-        IReadOnlyDictionary<string, string>? globalVarMap)
+        IReadOnlyDictionary<string, string>? globalVarMap,
+        IReadOnlySet<string>? dictionaryTypedFieldNames)
     {
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
@@ -72,6 +78,7 @@ public sealed class CodeGenerator
         _defaultMemberMap = defaultMemberMap;
         _methodParamMap = methodParamMap;
         _globalVarMap = globalVarMap;
+        _dictionaryTypedFieldNames = dictionaryTypedFieldNames;
     }
 
     public static string Generate(ModuleNode module, bool isStaticModule,
@@ -79,9 +86,10 @@ public sealed class CodeGenerator
         IReadOnlySet<string>? enumTypedFieldNames = null,
         IReadOnlyDictionary<string, string>? defaultMemberMap = null,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap = null,
-        IReadOnlyDictionary<string, string>? globalVarMap = null)
+        IReadOnlyDictionary<string, string>? globalVarMap = null,
+        IReadOnlySet<string>? dictionaryTypedFieldNames = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -534,7 +542,17 @@ public sealed class CodeGenerator
             {
                 string collExpr = Expr(fe.Collection);
                 string? collType = TryGetSimpleType(fe.Collection);
-                if (collType != null && collType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase))
+                bool isDictionary =
+                    (collType != null && collType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase)) ||
+                    (_dictionaryTypedFieldNames != null && fe.Collection switch
+                    {
+                        // bare identifier: local/param variable whose declared type is Dictionary
+                        IdentifierNode id          => _dictionaryTypedFieldNames.Contains(id.Name),
+                        // member access: obj.FieldName — check the field name cross-module
+                        MemberAccessNode m         => _dictionaryTypedFieldNames.Contains(m.MemberName),
+                        _                          => false,
+                    });
+                if (isDictionary)
                     collExpr += ".Values";
                 _w.WriteLine($"foreach (var {fe.VariableName} in {collExpr})");
                 _w.OpenBrace();
