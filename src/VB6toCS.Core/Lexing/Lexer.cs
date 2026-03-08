@@ -300,9 +300,9 @@ public sealed class Lexer
         sb.Append(Advance()); // H or O
         while (_pos < _src.Length && IsHexChar(_src[_pos]))
             sb.Append(Advance());
-        // optional type suffix: &, %
+        // optional type suffix: &, % — consume but do not include in token text
         if (_pos < _src.Length && (_src[_pos] == '&' || _src[_pos] == '%'))
-            sb.Append(Advance());
+            Advance();
         return new Token(TokenKind.IntegerLiteral, sb.ToString(), line, col);
     }
 
@@ -334,10 +334,10 @@ public sealed class Lexer
         }
 
         // Type suffixes: %, &, !, #, @
+        // Consume but do NOT append — the suffix only affects the token kind, not the text.
         if (_pos < _src.Length && "%&!#@".Contains(_src[_pos]))
         {
-            char suffix = _src[_pos];
-            sb.Append(Advance());
+            char suffix = Advance();
             if (suffix == '!' || suffix == '#' || suffix == '@') isDouble = true;
         }
 
@@ -361,7 +361,7 @@ public sealed class Lexer
                                 _pos + 1 < _src.Length &&
                                 char.IsLetter(_src[_pos + 1]);
             if (!isBangAccess && "%&!#@$".Contains(suffix))
-                sb.Append(Advance());
+                Advance(); // consume type-declaration suffix; do not include in identifier name
         }
 
         string text = sb.ToString();

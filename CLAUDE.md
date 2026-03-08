@@ -125,7 +125,7 @@ src/
       CollectionTypeInferrer.cs ← cross-module Collection<T> element type inference
     Transformation/
       TransformDiagnostic.cs
-      Transformer.cs      ← type normalization + error handling (Stage 4)
+      Transformer.cs      ← type normalization (Stage 4); error handling restructuring disabled
     CodeGeneration/
       CodeWriter.cs       ← indentation-aware line writer
       BuiltInMap.cs       ← VB6 built-in functions/constants → C# mapping table
@@ -162,10 +162,12 @@ CLAUDE.md                 ← this file
   (3) group `Property Get/Let/Set` into `CsPropertyNode`.
   Validated against `D46O003_1080.vbp`: all 137 files pass Stage 3 with 0 diagnostics.
 - **Stage 4 (IR Transformation): complete.** `Transformer.cs` in `VB6toCS.Core/Transformation/`.
-  Two passes: (1) type normalization (VB6 type names → C# types in all TypeRefNodes),
-  (2) error handling restructuring (`On Error GoTo` → `TryCatchNode`).
-  Validated against `D46O003_1080.vbp`: all 137 files pass Stage 4 with 33 diagnostics
-  (all flagging real patterns that need human review).
+  Single pass: type normalization (VB6 type names → C# types in all TypeRefNodes).
+  Error handling restructuring (`On Error GoTo` → `TryCatchNode`) has been **disabled** — VB6
+  error handling semantics differ too much from C# try/catch to be mechanically reliable.
+  `OnErrorNode`, `ResumeNode`, and error-handler `LabelNode`s are left in the body so the code
+  generator emits them as comments for manual developer review.
+  Validated against `D46O003_1080.vbp`: all 137 files pass Stage 4.
 - **Stage 5 (C# Code Generation): complete.** `CodeGenerator.cs` + `BuiltInMap.cs` + `ComTypeMap.cs` in `VB6toCS.Core/CodeGeneration/`.
   Full C# output for all VB6 constructs. Five cross-module maps built in `Program.cs` between
   Stages 4 and 5: `collectionTypeMap`, `enumMemberMap`, `enumTypedFieldNames`, `methodParamMap`, `globalVarMap`.
@@ -181,6 +183,22 @@ CLAUDE.md                 ← this file
     consistently returns a single known type are emitted with that inferred type instead.
   - `CollectionTypeInferrer` extended to infer element types through local `Collection`
     intermediates (e.g. `registros` correctly typed as `Collection<Collection<clsYasField>>`).
+  Post-compilation-error sprint (items 1–8 from TODO.md, all validated against D46O003_1080.vbp):
+  - All string literals now emitted as `@"..."` verbatim strings — fixes `""` escape sequences
+    and backslash handling simultaneously. ~1,110 errors eliminated.
+  - Missing optional args: trailing args omitted; middle args → `default /* missing optional */`.
+  - VB6 `Static` locals: `static` keyword removed (illegal in method bodies), comment added.
+  - `ref` on literals dropped (C# forbids it); `/* was ByRef */` comment added.
+  - `IndexNode` with 0 arguments now emits target only (no empty `[]`).
+  - Lexer: type-suffix characters (`%&!#@$`) consumed but NOT appended for identifiers and
+    number literals. Hex format: `&H1F` → `0x1F`.
+  - Additional fixes: numeric labels (`10:` → `_L10:`), `Imp` operator (`(!a || b)`),
+    `DateAdd`/`DateDiff`/`Choose`/`Switch` → `default /* TODO */`, nested `/* */` in block
+    comments fixed, VB6 `Or` in case patterns split into two labels, `Collection` in function
+    return types now resolved, `static const` → `const`, `const object` type inferred from
+    literal, missing VB6 constants added, `ByRef` optional param defaults stripped,
+    unqualified `Dictionary` type → `Dictionary<string, object>`.
+  Result: ~2,500 errors → ~290, of which ~286 are expected (COM/cross-project dependencies).
 - **Stage 6 (Roslyn formatting): not yet implemented.**
 
 ## How to run

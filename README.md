@@ -68,7 +68,7 @@ COM libraries with no known .NET mapping get a `<COMReference>` entry in the `.c
 | 5 | C# code generation | ✅ Complete |
 | 6 | Roslyn output formatting | Planned |
 
-**Integration test:** `D46O003_1080.vbp` — a real-world production ActiveX DLL (136 classes, 1 module, 0 forms, 6 COM references). All 137 files translate end-to-end to `.cs` files.
+**Integration test:** `D46O003_1080.vbp` — a real-world production ActiveX DLL (136 classes, 1 module, 0 forms, 6 COM references). All 137 files translate end-to-end to `.cs` files. The generated project compiles with only ~4 genuine translator errors remaining (1 function with mixed optional/required parameter ordering); all other build failures are due to absent COM/cross-project assembly references, which are expected in a standalone build.
 
 ## What the generated C# looks like
 
@@ -114,6 +114,9 @@ samples/
 
 - **COM type accuracy:** indexed COM members (e.g. `ADODB.Fields(i)`) are identified via a static lookup table (`ComTypeMap.cs`) covering ADODB, DAO, and MSXML. COM types not in the table fall back to method-call syntax and may need manual adjustment. A `.tlb` COM type library reader is planned to eliminate this limitation.
 - **`ref`/`out` parameters on COM methods:** resolved statically for known types; unknown COM method parameters default to `ref`.
-- **`Collection<T>` element type:** inferred from `.Add` call sites within the same project. Cross-module or late-bound element types fall back to `Collection<object>` with a `// REVIEW:` comment.
-- **On Error Resume Next:** translated with a `// VB6: On Error Resume Next` comment; errors are not suppressed in the C# output and must be reviewed manually.
+- **`Collection` / `Dictionary` element types:** inferred from `.Add` call sites within the same project. Collections default to `Dictionary<string, object>`; those with only unkeyed `.Add` calls become `List<T>`. Cross-module or late-bound element types fall back to `Dictionary<string, object>` with a `// REVIEW:` comment.
+- **VB6 error handling (`On Error GoTo`, `Resume`, etc.):** not converted to try/catch — VB6 error semantics differ too much from C# exception handling to be mechanically reliable. All error-related statements are emitted as comments (`// VB6: On Error GoTo ...`) with the original labels and `goto` statements left in place, giving the developer a clear picture of the original flow to restructure manually.
 - **GoSub/Return:** translated as labeled blocks with comments; not idiomatic C#.
+- **VB6 `Static` locals:** do not persist between calls in the generated C# (VB6 semantics differ). Marked with `// VB6 Static local — hoist to field if persistence needed`.
+- **Optional parameters with mixed ordering:** VB6 allows optional parameters before required ones; C# does not. One such function in the integration test requires manual parameter reordering.
+- **Date literals** (`#1/15/2020#`) and `DateAdd`/`DateDiff`/`DatePart` calls emit `default /* TODO */` placeholders for manual completion.

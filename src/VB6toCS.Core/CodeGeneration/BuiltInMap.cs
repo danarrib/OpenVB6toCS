@@ -37,8 +37,11 @@ internal static class BuiltInMap
                 string charArg = Arg(a, 1);
                 // VB6 String(n, c): c may be a string literal "x" → char literal 'x',
                 // or a number (char code) → (char)n, or a variable → var[0].
-                if (charArg.StartsWith('"') && charArg.EndsWith('"') && charArg.Length >= 3)
-                    charArg = $"'{charArg[1]}'"; // "0" → '0'
+                // String literal may be @"x" (verbatim) or "x" (regular); strip the prefix
+                bool isVerbatim = charArg.StartsWith("@\"");
+                string innerStr = isVerbatim ? charArg[1..] : charArg; // remove @ if present
+                if (innerStr.StartsWith('"') && innerStr.EndsWith('"') && innerStr.Length >= 3)
+                    charArg = $"'{innerStr[1]}'"; // "0" → '0'
                 else if (long.TryParse(charArg, out _))
                     charArg = $"(char){charArg}"; // 48 → (char)48
                 else
@@ -86,9 +89,9 @@ internal static class BuiltInMap
             ["Date"]      = _ => "DateTime.Now.Date",
             ["Time"]      = _ => "DateTime.Now.TimeOfDay",
             ["Timer"]     = _ => "DateTime.Now.TimeOfDay.TotalSeconds",
-            ["DateAdd"]   = a => $"/* DateAdd */ {RawArgs(a)} /* TODO: use DateTime.Add */",
-            ["DateDiff"]  = a => $"/* DateDiff */ {RawArgs(a)} /* TODO: use TimeSpan */",
-            ["DatePart"]  = a => $"/* DatePart */ {RawArgs(a)} /* TODO */",
+            ["DateAdd"]   = a => $"default /* TODO: DateAdd({BlockSafe(RawArgs(a))}) - use DateTime.Add */",
+            ["DateDiff"]  = a => $"default /* TODO: DateDiff({BlockSafe(RawArgs(a))}) - use TimeSpan */",
+            ["DatePart"]  = a => $"default /* TODO: DatePart({BlockSafe(RawArgs(a))}) */",
             ["Year"]      = a => $"{One(a)}.Year",
             ["Month"]     = a => $"{One(a)}.Month",
             ["Day"]       = a => $"{One(a)}.Day",
@@ -119,8 +122,8 @@ internal static class BuiltInMap
             // Misc
             ["IIf"]       = a => $"({Arg(a,0)} ? {Arg(a,1)} : {Arg(a,2)})",
             ["Nz"]        = a => $"({Arg(a,0)} ?? {(a.Length > 1 ? Arg(a,1) : "\"\"")}) /* Nz */",
-            ["Choose"]    = a => $"/* Choose */ {RawArgs(a)} /* TODO */",
-            ["Switch"]    = a => $"/* Switch */ {RawArgs(a)} /* TODO */",
+            ["Choose"]    = a => $"default /* TODO: Choose({BlockSafe(RawArgs(a))}) */",
+            ["Switch"]    = a => $"default /* TODO: Switch({BlockSafe(RawArgs(a))}) */",
         };
 
     // VB6 constants → C# equivalents
@@ -136,6 +139,23 @@ internal static class BuiltInMap
             ["vbTrue"]          = "true",
             ["vbFalse"]         = "false",
             ["vbObjectError"]   = "unchecked((int)0x80040000)",
+            // VB6 compare method constants
+            ["vbBinaryCompare"] = "0",
+            ["vbTextCompare"]   = "1",
+            ["vbDatabaseCompare"] = "2",
+            // VB6 MsgBox style constants
+            ["vbOKOnly"]        = "0",
+            ["vbOKCancel"]      = "1",
+            ["vbAbortRetryIgnore"] = "2",
+            ["vbYesNoCancel"]   = "3",
+            ["vbYesNo"]         = "4",
+            ["vbRetryCancel"]   = "5",
+            ["vbCritical"]      = "16",
+            ["vbQuestion"]      = "32",
+            ["vbExclamation"]   = "48",
+            ["vbInformation"]   = "64",
+            ["vbApplicationModal"] = "0",
+            ["vbSystemModal"]   = "4096",
             ["True"]            = "true",
             ["False"]           = "false",
             ["Nothing"]         = "null",
@@ -167,4 +187,11 @@ internal static class BuiltInMap
     private static string One(string[] a) => a.Length > 0 ? a[0] : "";
     private static string Arg(string[] a, int i) => i < a.Length ? a[i] : "";
     private static string RawArgs(string[] a) => string.Join(", ", a);
+
+    /// <summary>
+    /// Escapes block-comment delimiters so arg strings can be embedded inside /* … */
+    /// without prematurely closing the outer comment (nested /* */ are not valid in C#).
+    /// </summary>
+    private static string BlockSafe(string s) =>
+        s.Replace("*/", "* /").Replace("/*", "/ *");
 }

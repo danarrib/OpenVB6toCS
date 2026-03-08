@@ -56,6 +56,8 @@ public sealed class Transformer
             ["Currency"]   = "decimal",
             ["Variant"]    = "object",
             ["Object"]     = "object",
+            // Scripting.Dictionary used unqualified → generic Dictionary
+            ["Dictionary"] = "Dictionary<string, object>",
         };
 
     public ModuleNode Transform(ModuleNode module)
@@ -92,12 +94,12 @@ public sealed class Transformer
             FunctionNode f => f with
             {
                 Parameters = NormalizeParams(f.Parameters),
-                ReturnType = NormalizeType(f.ReturnType),
+                ReturnType = NormalizeReturnType(f.ReturnType, f.Name),
                 Body       = TransformBody(f.Body, f.Name, f.Line),
             },
             CsPropertyNode p => p with
             {
-                Type          = NormalizeType(p.Type),
+                Type          = NormalizeReturnType(p.Type, p.Name),
                 GetParameters = NormalizeParams(p.GetParameters),
                 GetBody       = p.GetBody  != null ? TransformBody(p.GetBody,  p.Name + ".Get", p.Line) : null,
                 LetParameters = NormalizeParams(p.LetParameters),
@@ -179,6 +181,12 @@ public sealed class Transformer
     private IReadOnlyList<AstNode> TransformErrorHandling(
         IReadOnlyList<AstNode> body, string context, int contextLine)
     {
+        // On Error GoTo → try/catch restructuring is disabled.
+        // VB6 error handling semantics differ too much from C# try/catch to be mechanically
+        // reliable. OnErrorNode, ResumeNode, and LabelNode are left in the body so the code
+        // generator can emit them as comments for manual review.
+        return body;
+
         // Locate all "On Error GoTo label" nodes in the direct statement list.
         int errorNodeIdx = -1;
         int goToCount = 0;
@@ -313,6 +321,19 @@ public sealed class Transformer
         return TypeMap.TryGetValue(t.TypeName, out var csName)
             ? t with { TypeName = csName }
             : t; // COM types, user-defined types, etc. — unchanged
+    }
+
+    /// <summary>
+    /// Like NormalizeType, but also resolves Collection return types to Dictionary/List.
+    /// Used for function and property return types (which don't have a field name for
+    /// element-type inference, so they always fall back to Dictionary&lt;string, object&gt;).
+    /// </summary>
+    private TypeRefNode? NormalizeReturnType(TypeRefNode? t, string procName)
+    {
+        if (t == null) return null;
+        if (t.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+            return ResolveCollectionType(t, procName, isField: false);
+        return NormalizeType(t);
     }
 
     /// <summary>

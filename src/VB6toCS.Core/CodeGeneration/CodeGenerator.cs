@@ -55,6 +55,10 @@ public sealed class CodeGenerator
     private Dictionary<string, string?> _localObjectInferred =
         new(StringComparer.OrdinalIgnoreCase);
 
+    // Per-procedure: set of label names (in CsLabel form) defined in the current body.
+    // Used by GoToNode to detect whether the target label is reachable.
+    private HashSet<string> _procLabels = new(StringComparer.OrdinalIgnoreCase);
+
     private CodeGenerator(bool isStatic,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
         IReadOnlySet<string>? enumTypedFieldNames,
@@ -152,7 +156,13 @@ public sealed class CodeGenerator
 
             case ConstDeclarationNode c:
                 foreach (var d in c.Declarators)
-                    _w.WriteLine($"{Access(c.Access)}{StaticMod()}const {TypeStr(d.TypeRef, d.Name)} {d.Name} = {(d.DefaultValue != null ? Expr(d.DefaultValue) : "default")};{ReviewComment(d.TypeRef)}");
+                {
+                    // const implies static in C# — omit StaticMod() to avoid "static const" error.
+                    // Also infer a concrete type from the literal value when the declared type is
+                    // object/Variant — C# only allows const object = null, not numeric/string values.
+                    string constType = InferConstType(d.TypeRef, d.DefaultValue);
+                    _w.WriteLine($"{Access(c.Access)}const {constType} {d.Name} = {(d.DefaultValue != null ? Expr(d.DefaultValue) : "default")};{ReviewComment(d.TypeRef)}");
+                }
                 break;
 
             case EnumNode e:
@@ -376,7 +386,10 @@ public sealed class CodeGenerator
                     string init = dec.DefaultValue != null
                         ? $" = {Expr(dec.DefaultValue)}"
                         : $" = {DefaultInit(typeStr)}";
-                    _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{reviewCmt}");
+                    // VB6 Static locals are not supported in C# — the variable does not
+                    // persist between calls. Hoist to a private field if persistence is needed.
+                    string staticCmt = d.IsStatic ? " // VB6 Static local — hoist to field if persistence needed" : "";
+                    _w.WriteLine($"{typeStr} {dec.Name}{init};{reviewCmt}{staticCmt}");
                 }
                 break;
 
@@ -486,7 +499,8 @@ public sealed class CodeGenerator
                         _w.WriteLine("default:");
                     else
                         foreach (var pat in c.Patterns)
-                            _w.WriteLine($"case {CasePattern(pat)}:");
+                            foreach (var lbl in CasePatternLabels(pat))
+                                _w.WriteLine($"case {lbl}:");
                     _w.OpenBrace();
                     foreach (var stmt in c.Body)
                         GenerateStatement(stmt, returnType, resultVar);
@@ -595,8 +609,14 @@ public sealed class CodeGenerator
                 break;
 
             case GoToNode g:
-                _w.WriteLine($"goto {g.Label};");
+            {
+                string csLbl = CsLabel(g.Label);
+                if (_procLabels.Contains(csLbl))
+                    _w.WriteLine($"goto {csLbl};");
+                else
+                    _w.WriteLine($"// goto {csLbl}; — label not found in scope, commented out");
                 break;
+            }
 
             case GoSubNode g:
                 _w.WriteLine($"// TODO: GoSub {g.Label} — convert to method call");
@@ -607,8 +627,9 @@ public sealed class CodeGenerator
                 break;
 
             case LabelNode l:
-                // Labels must be at the method body level; dedent by one for the label itself
-                _w.WriteLine($"{l.Name}:;");
+                // Labels must be at the method body level; dedent by one for the label itself.
+                // C# identifiers cannot start with a digit — prefix numeric labels with _L.
+                _w.WriteLine($"{CsLabel(l.Name)}:");
                 break;
 
             case ErrorStatementNode e:
@@ -670,9 +691,9 @@ public sealed class CodeGenerator
         NothingNode                 => "null",
         MeNode                      => "this",
         BoolLiteralNode b           => b.Value ? "true" : "false",
-        IntegerLiteralNode i        => i.RawText,
+        IntegerLiteralNode i        => ConvertIntLiteral(i.RawText),
         DoubleLiteralNode d         => d.RawText,
-        StringLiteralNode s         => s.RawText,
+        StringLiteralNode s         => $"@{s.RawText}",
         DateLiteralNode d           => $"DateTime.Parse({d.RawText}) /* date literal */",
 
         IdentifierNode id           => MapIdentifier(id.Name),
@@ -683,7 +704,9 @@ public sealed class CodeGenerator
         BangAccessNode b            => $"{Expr(b.Object)}[\"{b.MemberName}\"] /* ! */",
         WithMemberAccessNode w      => $"{CurrentWith()}.{w.MemberName}",
 
-        IndexNode ix                => $"{Expr(ix.Target)}[{Args(ix.Arguments)}]",
+        IndexNode ix                => ix.Arguments.Count > 0
+                                        ? $"{Expr(ix.Target)}[{Args(ix.Arguments)}]"
+                                        : Expr(ix.Target),
         CallOrIndexNode c           => MapCall(c),
 
         UnaryExpressionNode u       => MapUnary(u),
@@ -845,7 +868,7 @@ public sealed class CodeGenerator
                 }
             }
 
-            string[] argArr = c.Arguments.Select(a => a.IsMissing ? "/* missing */" : Expr(a.Value!)).ToArray();
+            string[] argArr = c.Arguments.Select(a => a.IsMissing ? "default" : Expr(a.Value!)).ToArray();
             if (BuiltInMap.TryGetFunction(id.Name, argArr, out var mapped))
             {
                 // If a built-in that coerces to string/double receives an object returned from
@@ -869,7 +892,7 @@ public sealed class CodeGenerator
         if (c.Target is MemberAccessNode ma)
         {
             string fullName = $"{Expr(ma.Object)}.{ma.MemberName}";
-            string[] argArr = c.Arguments.Select(a => a.IsMissing ? "/* missing */" : Expr(a.Value!)).ToArray();
+            string[] argArr = c.Arguments.Select(a => a.IsMissing ? "default" : Expr(a.Value!)).ToArray();
             if (BuiltInMap.TryGetFunction(fullName, argArr, out var mapped))
                 return mapped;
 
@@ -1011,6 +1034,45 @@ public sealed class CodeGenerator
     {
         EnterProcScope(parameters);
         _localObjectInferred = ComputeLocalObjectInference(parameters, body);
+        _procLabels = CollectLabels(body);
+    }
+
+    /// <summary>Recursively collects all LabelNode names (in CsLabel form) from a body.</summary>
+    private static HashSet<string> CollectLabels(IReadOnlyList<AstNode> body)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectLabelsInto(body, set);
+        return set;
+    }
+
+    private static void CollectLabelsInto(IReadOnlyList<AstNode> body, HashSet<string> set)
+    {
+        foreach (var node in body)
+        {
+            if (node is LabelNode l)
+                set.Add(CsLabel(l.Name));
+            // Recurse into nested bodies
+            switch (node)
+            {
+                case IfNode i:
+                    CollectLabelsInto(i.ThenBody, set);
+                    foreach (var ei in i.ElseIfClauses) CollectLabelsInto(ei.Body, set);
+                    if (i.ElseBody != null) CollectLabelsInto(i.ElseBody, set);
+                    break;
+                case SelectCaseNode s:
+                    foreach (var c in s.Cases) CollectLabelsInto(c.Body, set);
+                    break;
+                case ForNextNode f:  CollectLabelsInto(f.Body, set);  break;
+                case ForEachNode fe: CollectLabelsInto(fe.Body, set); break;
+                case WhileNode w:    CollectLabelsInto(w.Body, set);  break;
+                case DoLoopNode dl:  CollectLabelsInto(dl.Body, set); break;
+                case WithNode w:     CollectLabelsInto(w.Body, set);  break;
+                case TryCatchNode tc:
+                    CollectLabelsInto(tc.TryBody, set);
+                    CollectLabelsInto(tc.CatchBody, set);
+                    break;
+            }
+        }
     }
 
     /// <summary>
@@ -1416,6 +1478,57 @@ public sealed class CodeGenerator
         type is "int" or "long" or "double" or "float" or "decimal" or "byte";
 
     /// <summary>
+    /// Infers the best C# type for a const declaration.
+    /// When the declared type is object/Variant (or absent), falls back to the
+    /// literal value type — C# forbids "const object = nonNull".
+    /// </summary>
+    private string InferConstType(TypeRefNode? typeRef, ExpressionNode? value)
+    {
+        string declared = TypeStr(typeRef, "");
+        if (declared != "object") return declared;
+        // Infer from literal value
+        return value switch
+        {
+            IntegerLiteralNode                         => "int",
+            DoubleLiteralNode                          => "double",
+            StringLiteralNode                          => "string",
+            BoolLiteralNode                            => "bool",
+            NothingNode                                => "object",  // null is allowed
+            UnaryExpressionNode { Operator: TokenKind.Minus,
+                Operand: IntegerLiteralNode }          => "int",
+            UnaryExpressionNode { Operator: TokenKind.Minus,
+                Operand: DoubleLiteralNode }           => "double",
+            _                                          => "object",
+        };
+    }
+
+    /// <summary>
+    /// Converts a VB6 integer literal token text to its C# equivalent.
+    /// VB6 hex (&H1F) → C# hex (0x1F); VB6 octal (&O17) → decimal equivalent.
+    /// </summary>
+    private static string ConvertIntLiteral(string raw)
+    {
+        if (raw.StartsWith("&H", StringComparison.OrdinalIgnoreCase))
+            return "0x" + raw[2..];
+        if (raw.StartsWith("&O", StringComparison.OrdinalIgnoreCase))
+        {
+            // Convert octal to decimal
+            if (long.TryParse(raw[2..], System.Globalization.NumberStyles.None, null, out long octalDigits))
+                return Convert.ToInt64(raw[2..], 8).ToString();
+            return raw; // fallback: leave as-is
+        }
+        return raw;
+    }
+
+    /// <summary>
+    /// Ensures a VB6 label name is a valid C# identifier.
+    /// VB6 allows purely numeric line labels (e.g. 10, 20); C# requires identifiers
+    /// to start with a letter or underscore, so we prefix them with _L.
+    /// </summary>
+    private static string CsLabel(string vb6Label) =>
+        vb6Label.Length > 0 && char.IsDigit(vb6Label[0]) ? $"_L{vb6Label}" : vb6Label;
+
+    /// <summary>
     /// Returns a C# expression for <paramref name="node"/> guaranteed to be a string.
     /// String types are returned as-is; nullable value types get .GetValueOrDefault().ToString();
     /// everything else gets .ToString().
@@ -1481,6 +1594,10 @@ public sealed class CodeGenerator
         if (b.Operator == TokenKind.Caret)
             return $"Math.Pow({left}, {right})";
 
+        // VB6 Imp (logical implication): a Imp b ≡ (Not a) Or b → (!a || b)
+        if (b.Operator == TokenKind.KwImp)
+            return $"(!({left}) || {right})";
+
         // Integer division — emit cast to make intent clear
         if (b.Operator == TokenKind.Backslash)
             return $"((int)({left}) / (int)({right}))";
@@ -1539,7 +1656,7 @@ public sealed class CodeGenerator
             TokenKind.KwXor        => "^",
             TokenKind.KwIs         => "==",  // reference equality
             TokenKind.KwEqv        => "==",  // approx
-            TokenKind.KwImp        => "/* Imp */ ||",  // !left || right
+            TokenKind.KwImp        => "||",  // handled above; fallback only
             TokenKind.KwLike       => $"/* Like — use Regex */ ==",
             _                      => $"/* {b.Operator} */"
         };
@@ -1554,6 +1671,28 @@ public sealed class CodeGenerator
         CaseIsPattern i     => $"/* Is */ {MapCaseOp(i.Operator)} {Expr(i.Value)}",
         _                   => "default"
     };
+
+    /// <summary>
+    /// Returns one or more C# case label strings for a single VB6 case pattern.
+    /// VB6 allows "Case expr1 Or expr2" as a single pattern whose value is a bitwise OR;
+    /// since this is not a constant in C#, we split it into two separate case labels
+    /// (closest match to the programmer's intent in most real-world code).
+    /// </summary>
+    private IEnumerable<string> CasePatternLabels(CasePatternNode p)
+    {
+        if (p is CaseValuePattern { Value: BinaryExpressionNode { Operator: TokenKind.KwOr } be })
+        {
+            // Split "expr1 Or expr2" into two case labels with a note
+            foreach (var lbl in CasePatternLabels(new CaseValuePattern(be.Line, be.Column, be.Left)))
+                yield return lbl;
+            foreach (var lbl in CasePatternLabels(new CaseValuePattern(be.Line, be.Column, be.Right)))
+                yield return $"{lbl} /* was: Or */";
+        }
+        else
+        {
+            yield return CasePattern(p);
+        }
+    }
 
     private static string MapCaseOp(TokenKind op) => op switch
     {
@@ -1576,19 +1715,38 @@ public sealed class CodeGenerator
 
     private string ParamStr(ParameterNode p)
     {
-        string modifier  = p.Mode == ParameterMode.ByRef ? "ref " : "";
-        string optional  = p.IsOptional ? "/* Optional */ " : "";
-        string paramArr  = p.IsParamArray ? "params " : "";
-        string typeStr   = TypeStr(p.TypeRef, p.Name);
-        string defVal    = p.DefaultValue != null ? $" = {Expr(p.DefaultValue)}" : "";
+        bool isByRef    = p.Mode == ParameterMode.ByRef;
+        string modifier = isByRef ? "ref " : "";
+        string optional = p.IsOptional ? "/* Optional */ " : "";
+        string paramArr = p.IsParamArray ? "params " : "";
+        string typeStr  = TypeStr(p.TypeRef, p.Name);
+        // C# forbids default values on ref parameters (CS1741); strip the default
+        // and leave a comment so the caller knows to review it.
+        string defVal   = (p.DefaultValue != null && !isByRef)
+            ? $" = {Expr(p.DefaultValue)}"
+            : (p.DefaultValue != null ? $" /* default: {Expr(p.DefaultValue)} — removed, ref param */" : "");
         return $"{optional}{paramArr}{modifier}{typeStr} {p.Name}{defVal}";
     }
 
-    private string Args(IReadOnlyList<ArgumentNode> args) =>
-        string.Join(", ", args.Select(a =>
-            a.IsMissing ? "/* missing */" :
-            a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" :
-            Expr(a.Value!)));
+    private string Args(IReadOnlyList<ArgumentNode> args)
+    {
+        // Trailing missing args can simply be omitted (C# optional params allow this).
+        int last = args.Count - 1;
+        while (last >= 0 && args[last].IsMissing) last--;
+
+        var parts = new List<string>(last + 1);
+        for (int i = 0; i <= last; i++)
+        {
+            var a = args[i];
+            if (a.IsMissing)
+                parts.Add("default /* missing optional */");
+            else if (a.Name != null)
+                parts.Add($"/* {a.Name}: */ {Expr(a.Value!)}");
+            else
+                parts.Add(Expr(a.Value!));
+        }
+        return string.Join(", ", parts);
+    }
 
     /// <summary>
     /// Like Args(), but prepends `ref ` to positional arguments whose corresponding
@@ -1598,14 +1756,29 @@ public sealed class CodeGenerator
         IReadOnlyList<Parsing.Nodes.ParameterMode>? modes)
     {
         if (modes == null) return Args(args);
-        var parts = new List<string>(args.Count);
-        for (int i = 0; i < args.Count; i++)
+
+        // Trailing missing args can simply be omitted (C# optional params allow this).
+        int last = args.Count - 1;
+        while (last >= 0 && args[last].IsMissing) last--;
+
+        var parts = new List<string>(last + 1);
+        for (int i = 0; i <= last; i++)
         {
             var a = args[i];
-            if (a.IsMissing) { parts.Add("/* missing */"); continue; }
+            if (a.IsMissing) { parts.Add("default /* missing optional */"); continue; }
             string expr = a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" : Expr(a.Value!);
             bool isByRef = i < modes.Count && modes[i] == Parsing.Nodes.ParameterMode.ByRef;
-            parts.Add(isByRef ? $"ref {expr}" : expr);
+            if (isByRef)
+            {
+                // C# forbids `ref` on a literal — drop the modifier and flag for review.
+                bool isLiteral = a.Value is IntegerLiteralNode or DoubleLiteralNode
+                    or StringLiteralNode or BoolLiteralNode or DateLiteralNode or NothingNode;
+                parts.Add(isLiteral ? $"{expr} /* was ByRef */" : $"ref {expr}");
+            }
+            else
+            {
+                parts.Add(expr);
+            }
         }
         return string.Join(", ", parts);
     }
