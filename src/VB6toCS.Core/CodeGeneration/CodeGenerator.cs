@@ -43,6 +43,18 @@ public sealed class CodeGenerator
     // Procedure-level types: parameters + locals (cleared on each procedure entry).
     private readonly Dictionary<string, string> _procTypes = new(StringComparer.OrdinalIgnoreCase);
 
+    // Per-module: resolved return type for every Function and Property Get, built before
+    // any body is generated so that local-variable inference can look up callee return types.
+    private readonly Dictionary<string, string> _moduleFunctionReturnTypes =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // Per-procedure: inferred C# type for each object-typed local variable.
+    // null  → could not infer (keep as object).
+    // string starting with "/* CONFLICT:" → conflicting assignment types (keep object, emit comment).
+    // any other string → the inferred type to use in the declaration.
+    private Dictionary<string, string?> _localObjectInferred =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private CodeGenerator(bool isStatic,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
         IReadOnlySet<string>? enumTypedFieldNames,
@@ -99,6 +111,9 @@ public sealed class CodeGenerator
             if (csP?.Type != null)
                 _moduleFieldTypes[csP.Name] = csP.Type.TypeName;
         }
+
+        // Build function return-type map so local-variable inference can look up callees.
+        BuildFunctionReturnTypeMap(module.Members);
 
         string staticKw  = _isStatic ? "static " : "";
         string baseClause = module.Implements.Count > 0
@@ -186,7 +201,7 @@ public sealed class CodeGenerator
         string staticKw = _isStatic || s.IsStatic ? "static " : "";
         _w.WriteLine($"{Access(s.Access)}{staticKw}void {s.Name}({Params(s.Parameters)})");
         _w.OpenBrace();
-        EnterProcScope(s.Parameters);
+        SetupProcScope(s.Parameters, s.Body);
         GenerateBody(s.Body, returnType: null);
         _w.CloseBrace();
     }
@@ -198,7 +213,7 @@ public sealed class CodeGenerator
         returnType = InferActualReturnType(f.Parameters, f.Body, returnType);
         _w.WriteLine($"{Access(f.Access)}{staticKw}{returnType} {f.Name}({Params(f.Parameters)})");
         _w.OpenBrace();
-        EnterProcScope(f.Parameters);
+        SetupProcScope(f.Parameters, f.Body);
         GenerateBodyWithReturn(f.Body, returnType);
         _w.CloseBrace();
     }
@@ -224,7 +239,7 @@ public sealed class CodeGenerator
 
         if (p.GetBody != null)
         {
-            EnterProcScope(p.GetParameters);
+            SetupProcScope(p.GetParameters, p.GetBody);
             _w.WriteLine("get");
             _w.OpenBrace();
             GenerateBodyWithReturn(p.GetBody, propType);
@@ -233,7 +248,7 @@ public sealed class CodeGenerator
 
         if (p.LetBody != null)
         {
-            EnterProcScope(p.LetParameters);
+            SetupProcScope(p.LetParameters, p.LetBody);
             string valueParam = p.LetParameters.Count > 0
                 ? p.LetParameters[^1].Name : "value";
             _w.WriteLine($"set  // Let — parameter: {valueParam}");
@@ -244,7 +259,7 @@ public sealed class CodeGenerator
 
         if (p.SetBody != null)
         {
-            EnterProcScope(p.SetParameters);
+            SetupProcScope(p.SetParameters, p.SetBody);
             string valueParam = p.SetParameters.Count > 0
                 ? p.SetParameters[^1].Name : "value";
             _w.WriteLine($"set  // Set — parameter: {valueParam}");
@@ -270,7 +285,7 @@ public sealed class CodeGenerator
 
         if (p.GetBody != null)
         {
-            EnterProcScope(p.GetParameters);
+            SetupProcScope(p.GetParameters, p.GetBody);
             _w.WriteLine($"{Access(p.Access)}{staticKw}{propType} {p.Name}({Params(p.GetParameters)})");
             _w.OpenBrace();
             GenerateBodyWithReturn(p.GetBody, propType);
@@ -279,7 +294,7 @@ public sealed class CodeGenerator
 
         if (p.LetBody != null)
         {
-            EnterProcScope(p.LetParameters);
+            SetupProcScope(p.LetParameters, p.LetBody);
             // All parameters including the trailing value parameter
             _w.WriteLine($"{Access(p.Access)}{staticKw}void {p.Name}({Params(p.LetParameters)})  // Property Let");
             _w.OpenBrace();
@@ -289,7 +304,7 @@ public sealed class CodeGenerator
 
         if (p.SetBody != null)
         {
-            EnterProcScope(p.SetParameters);
+            SetupProcScope(p.SetParameters, p.SetBody);
             _w.WriteLine($"{Access(p.Access)}{staticKw}void {p.Name}({Params(p.SetParameters)})  // Property Set");
             _w.OpenBrace();
             GenerateBody(p.SetBody, returnType: null);
@@ -332,12 +347,36 @@ public sealed class CodeGenerator
             case LocalDimNode d:
                 foreach (var dec in d.Declarators)
                 {
-                    if (dec.TypeRef != null) _procTypes[dec.Name] = dec.TypeRef.TypeName;
-                    string typeStr = TypeStr(dec.TypeRef, dec.Name);
-                    string init    = dec.DefaultValue != null
+                    string typeStr   = TypeStr(dec.TypeRef, dec.Name);
+                    string reviewCmt = ReviewComment(dec.TypeRef) ?? "";
+
+                    // For object-typed locals, try to substitute the inferred type.
+                    if (typeStr == "object" &&
+                        _localObjectInferred.TryGetValue(dec.Name, out var inf) &&
+                        inf != null)
+                    {
+                        if (!inf.StartsWith("/* CONFLICT:"))
+                        {
+                            // Consistent inferred type — use it and update scope.
+                            typeStr = inf;
+                            _procTypes[dec.Name] = inf;
+                        }
+                        else
+                        {
+                            // Conflicting types — keep object, emit comment.
+                            _procTypes[dec.Name] = "object";
+                            reviewCmt += " " + inf;
+                        }
+                    }
+                    else
+                    {
+                        if (dec.TypeRef != null) _procTypes[dec.Name] = dec.TypeRef.TypeName;
+                    }
+
+                    string init = dec.DefaultValue != null
                         ? $" = {Expr(dec.DefaultValue)}"
                         : $" = {DefaultInit(typeStr)}";
-                    _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{ReviewComment(dec.TypeRef)}");
+                    _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{reviewCmt}");
                 }
                 break;
 
@@ -855,6 +894,16 @@ public sealed class CodeGenerator
                 return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
         }
 
+        // Array-typed variable access: myArr(i) → myArr[i]
+        // Applies when the target is a local or field variable whose inferred/declared type
+        // is an array (ends with "[]"), e.g. after Variant→string[] inference.
+        if (c.Arguments.Count > 0)
+        {
+            string? targetType = TryGetSimpleType(c.Target);
+            if (targetType != null && targetType.EndsWith("[]"))
+                return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+        }
+
         // General call
         string target = Expr(c.Target);
         string args   = c.Arguments.Count > 0
@@ -926,6 +975,203 @@ public sealed class CodeGenerator
         foreach (var p in parameters)
             if (p.TypeRef != null)
                 _procTypes[p.Name] = p.TypeRef.TypeName;
+    }
+
+    /// <summary>
+    /// Resets procedure scope and pre-computes local-variable type inference for
+    /// object-typed locals in <paramref name="body"/>.
+    /// </summary>
+    private void SetupProcScope(IReadOnlyList<ParameterNode> parameters, IReadOnlyList<AstNode> body)
+    {
+        EnterProcScope(parameters);
+        _localObjectInferred = ComputeLocalObjectInference(parameters, body);
+    }
+
+    /// <summary>
+    /// Pre-scans the module's members and records the resolved C# return type for every
+    /// Function and Property Get.  This map is used by <see cref="ComputeLocalObjectInference"/>
+    /// to determine the type produced by calls to module-local functions.
+    /// </summary>
+    private void BuildFunctionReturnTypeMap(IReadOnlyList<AstNode> members)
+    {
+        _moduleFunctionReturnTypes.Clear();
+        foreach (var member in members)
+        {
+            switch (member)
+            {
+                case FunctionNode f:
+                {
+                    string rt = TypeStr(f.ReturnType, f.Name);
+                    rt = InferActualReturnType(f.Parameters, f.Body, rt);
+                    _moduleFunctionReturnTypes[f.Name] = rt;
+                    break;
+                }
+                case CsPropertyNode p when p.GetBody != null:
+                {
+                    _moduleFunctionReturnTypes[p.Name] = TypeStr(p.Type, p.Name);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// For each local variable declared as <c>object</c> (VB6 Variant) in <paramref name="body"/>,
+    /// inspects every assignment to that variable and tries to determine a consistent C# type.
+    /// <list type="bullet">
+    ///   <item>Single consistent type → the inferred type string.</item>
+    ///   <item>Conflicting types     → a "/* CONFLICT: T1, T2 */" string (caller keeps object + emits comment).</item>
+    ///   <item>Cannot determine      → null (caller keeps object silently).</item>
+    /// </list>
+    /// </summary>
+    private Dictionary<string, string?> ComputeLocalObjectInference(
+        IReadOnlyList<ParameterNode> parameters,
+        IReadOnlyList<AstNode> body)
+    {
+        var objectLocals = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectObjectLocalNames(body, objectLocals);
+        if (objectLocals.Count == 0)
+            return new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+
+        // Full type-ref map for RHS resolution.
+        var typeRefs = new Dictionary<string, TypeRefNode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in parameters)
+            if (p.TypeRef != null) typeRefs[p.Name] = p.TypeRef;
+        CollectBodyTypeRefs(body, typeRefs);
+
+        var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var varName in objectLocals)
+        {
+            var assignedTypes = new List<string?>();
+            CollectAssignmentsToVar(varName, body, typeRefs, assignedTypes);
+
+            var known = assignedTypes
+                .Where(t => t != null && !t.Equals("object", StringComparison.OrdinalIgnoreCase))
+                .Select(t => t!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            result[varName] = known.Count switch
+            {
+                0 => null,
+                1 => known[0],
+                _ => $"/* CONFLICT: {string.Join(", ", known)} */"
+            };
+        }
+        return result;
+    }
+
+    /// <summary>Recursively collects names of locals declared as <c>object</c> (or no type).</summary>
+    private static void CollectObjectLocalNames(IReadOnlyList<AstNode> body, HashSet<string> result)
+    {
+        foreach (var node in body)
+        {
+            if (node is LocalDimNode dim)
+                foreach (var d in dim.Declarators)
+                    if (d.TypeRef == null ||
+                        d.TypeRef.TypeName.Equals("object", StringComparison.OrdinalIgnoreCase))
+                        result.Add(d.Name);
+
+            IEnumerable<IReadOnlyList<AstNode>> children = node switch
+            {
+                IfNode i         => i.ElseBody != null
+                                    ? i.ElseIfClauses.Select(e => e.Body)
+                                        .Append(i.ThenBody).Append(i.ElseBody)
+                                    : i.ElseIfClauses.Select(e => e.Body).Append(i.ThenBody),
+                SelectCaseNode s => s.Cases.Select(c => c.Body),
+                ForNextNode f    => [f.Body],
+                ForEachNode f    => [f.Body],
+                WhileNode w      => [w.Body],
+                DoLoopNode d     => [d.Body],
+                WithNode w       => [w.Body],
+                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                _                => []
+            };
+            foreach (var child in children)
+                CollectObjectLocalNames(child, result);
+        }
+    }
+
+    /// <summary>
+    /// Recursively scans <paramref name="body"/> for simple assignments to <paramref name="varName"/>
+    /// and calls <see cref="TryGetAssignedType"/> on each RHS, appending the result to
+    /// <paramref name="assignedTypes"/>.
+    /// </summary>
+    private void CollectAssignmentsToVar(
+        string varName,
+        IReadOnlyList<AstNode> body,
+        IReadOnlyDictionary<string, TypeRefNode> localTypeRefs,
+        List<string?> assignedTypes)
+    {
+        foreach (var node in body)
+        {
+            if (node is AssignmentNode a &&
+                a.Target is IdentifierNode tid &&
+                tid.Name.Equals(varName, StringComparison.OrdinalIgnoreCase))
+            {
+                assignedTypes.Add(TryGetAssignedType(a.Value, localTypeRefs));
+            }
+
+            IEnumerable<IReadOnlyList<AstNode>> children = node switch
+            {
+                IfNode i         => i.ElseBody != null
+                                    ? i.ElseIfClauses.Select(e => e.Body)
+                                        .Append(i.ThenBody).Append(i.ElseBody)
+                                    : i.ElseIfClauses.Select(e => e.Body).Append(i.ThenBody),
+                SelectCaseNode s => s.Cases.Select(c => c.Body),
+                ForNextNode f    => [f.Body],
+                ForEachNode f    => [f.Body],
+                WhileNode w      => [w.Body],
+                DoLoopNode d     => [d.Body],
+                WithNode w       => [w.Body],
+                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                _                => []
+            };
+            foreach (var child in children)
+                CollectAssignmentsToVar(varName, child, localTypeRefs, assignedTypes);
+        }
+    }
+
+    /// <summary>
+    /// Tries to determine the C# type of an assignment RHS expression.
+    /// Handles literals, identifiers in the local type-ref map,
+    /// and direct calls to module-local functions in <see cref="_moduleFunctionReturnTypes"/>.
+    /// Returns null when the type cannot be determined.
+    /// </summary>
+    private string? TryGetAssignedType(
+        ExpressionNode rhs,
+        IReadOnlyDictionary<string, TypeRefNode> localTypeRefs)
+    {
+        switch (rhs)
+        {
+            case StringLiteralNode:  return "string";
+            case IntegerLiteralNode: return "int";
+            case DoubleLiteralNode:  return "double";
+            case BoolLiteralNode:    return "bool";
+
+            case IdentifierNode id:
+                // Local variable or parameter.
+                if (localTypeRefs.TryGetValue(id.Name, out var tr))
+                {
+                    string t = TypeStr(tr, id.Name);
+                    if (!t.Equals("object", StringComparison.OrdinalIgnoreCase)) return t;
+                }
+                // Bare call to a module-local function (no argument list).
+                if (_moduleFunctionReturnTypes.TryGetValue(id.Name, out var fnT) &&
+                    !fnT.Equals("object", StringComparison.OrdinalIgnoreCase))
+                    return fnT;
+                return null;
+
+            case CallOrIndexNode call when call.Target is IdentifierNode callId:
+                // Direct call to a module-local function: Foo(args).
+                if (_moduleFunctionReturnTypes.TryGetValue(callId.Name, out var fnT2) &&
+                    !fnT2.Equals("object", StringComparison.OrdinalIgnoreCase))
+                    return fnT2;
+                return null;
+
+            default:
+                return null;
+        }
     }
 
     /// <summary>
