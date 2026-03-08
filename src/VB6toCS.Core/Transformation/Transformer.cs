@@ -26,13 +26,19 @@ public sealed class Transformer
     // Key: (moduleName, fieldName).  Value: the single inferred element type.
     private readonly IReadOnlyDictionary<(string, string), string>? _collectionTypes;
 
+    // Inferred Collection kind (Dictionary / List / Collection) per field.
+    // Only fields with unambiguous Add-call patterns appear in this map.
+    private readonly IReadOnlyDictionary<(string, string), CollectionKind>? _collectionKinds;
+
     private string _currentContext = "<module>";
     private string _currentModuleName = "";
 
     public Transformer(
-        IReadOnlyDictionary<(string, string), string>? collectionTypes = null)
+        IReadOnlyDictionary<(string, string), string>? collectionTypes = null,
+        IReadOnlyDictionary<(string, string), CollectionKind>? collectionKinds = null)
     {
         _collectionTypes = collectionTypes;
+        _collectionKinds = collectionKinds;
     }
 
     // VB6 primitive type names → C# equivalents
@@ -356,24 +362,43 @@ public sealed class Transformer
     }
 
     /// <summary>
-    /// Resolves a Collection TypeRefNode to Collection&lt;T&gt;.
-    /// For fields, consults the cross-module inferred type map first.
-    /// Emits a warning only when no specific type could be determined.
+    /// Resolves a Collection TypeRefNode to the most appropriate C# collection type.
+    /// For fields, consults the inferred kind and element type maps:
+    /// <list type="bullet">
+    ///   <item><see cref="CollectionKind.Dictionary"/> → <c>Dictionary&lt;string, T&gt;</c></item>
+    ///   <item><see cref="CollectionKind.List"/>       → <c>List&lt;T&gt;</c></item>
+    ///   <item>otherwise                               → <c>Collection&lt;T&gt;</c> with REVIEW warning</item>
+    /// </list>
+    /// Non-field (locals, parameters) always become <c>Collection&lt;object&gt;</c> for now.
     /// </summary>
     private TypeRefNode ResolveCollectionType(TypeRefNode t, string name, bool isField)
     {
         string? elemType = null;
+        CollectionKind kind = CollectionKind.Collection;
 
         if (isField && _collectionTypes != null)
             _collectionTypes.TryGetValue((_currentModuleName, name), out elemType);
+        if (isField && _collectionKinds != null)
+            _collectionKinds.TryGetValue((_currentModuleName, name), out kind);
 
-        if (elemType == null)
-            Warn(_currentContext,
-                $"'{name}' is a Collection whose element type could not be inferred; " +
-                "translated to Collection<object>. Consider replacing with List<T> or Dictionary<string, T>.",
-                t.Line, t.Column);
+        string elem = elemType ?? "object";
 
-        return t with { TypeName = $"Collection<{elemType ?? "object"}>" };
+        switch (kind)
+        {
+            case CollectionKind.Dictionary:
+                return t with { TypeName = $"Dictionary<string, {elem}>" };
+
+            case CollectionKind.List:
+                return t with { TypeName = $"List<{elem}>" };
+
+            default: // Collection or unknown
+                if (elemType == null)
+                    Warn(_currentContext,
+                        $"'{name}' is a Collection whose element type could not be inferred; " +
+                        "translated to Collection<object>. Consider replacing with List<T> or Dictionary<string, T>.",
+                        t.Line, t.Column);
+                return t with { TypeName = $"Collection<{elem}>" };
+        }
     }
 
     // ── Diagnostic helpers ───────────────────────────────────────────────────

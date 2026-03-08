@@ -410,6 +410,13 @@ public sealed class CodeGenerator
                 break;
 
             case CallStatementNode c:
+                // Statement-form Collection.Add: col.Add item, key (target is bare MemberAccess, not wrapped in CallOrIndex)
+                if (c.Target is MemberAccessNode stmtMa && c.Arguments.Count > 0)
+                {
+                    string? collMapped = TryMapCollectionMember(stmtMa.Object, stmtMa.MemberName, c.Arguments);
+                    if (collMapped != null) { _w.WriteLine($"{collMapped};"); break; }
+                }
+
                 string callTarget = Expr(c.Target);
                 // When ExplicitCall is true but the target is already a CallOrIndexNode (e.g.
                 // `Call Foo(x)` where the parser absorbed the parens into the node), don't add
@@ -500,11 +507,17 @@ public sealed class CodeGenerator
                 break;
 
             case ForEachNode fe:
-                _w.WriteLine($"foreach (var {fe.VariableName} in {Expr(fe.Collection)})");
+            {
+                string collExpr = Expr(fe.Collection);
+                string? collType = TryGetSimpleType(fe.Collection);
+                if (collType != null && collType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase))
+                    collExpr += ".Values";
+                _w.WriteLine($"foreach (var {fe.VariableName} in {collExpr})");
                 _w.OpenBrace();
                 foreach (var s in fe.Body) GenerateStatement(s, returnType, resultVar);
                 _w.CloseBrace();
                 break;
+            }
 
             case WhileNode w:
                 _w.WriteLine($"while ({Expr(w.Condition)})");
@@ -682,9 +695,9 @@ public sealed class CodeGenerator
     private string NewObjectExpr(NewObjectNode n)
     {
         // VB6 "New Collection" → C# "new()" (target-typed new, C# 9+).
-        // The element type is inferred by the compiler from the assignment target's
-        // declared type, which is already correctly set to Collection<T> or
-        // Collection<object> by the Transformer.
+        // The assignment target's declared type is already set to Collection<T>,
+        // Dictionary<string,T>, or List<T> by the Transformer, so the compiler
+        // can always infer the concrete type from the LHS.
         if (n.TypeName.Equals("Collection", StringComparison.OrdinalIgnoreCase))
         {
             _requiredUsings.Add("System.Collections.ObjectModel");
@@ -884,6 +897,13 @@ public sealed class CodeGenerator
                 return $"{idTarget.Name}.{defMember}({Args(c.Arguments)})";
         }
 
+        // Collection/List/Dictionary member access: .Add, .Item, .Remove
+        if (c.Target is MemberAccessNode collMa)
+        {
+            string? mapped = TryMapCollectionMember(collMa.Object, collMa.MemberName, c.Arguments);
+            if (mapped != null) return mapped;
+        }
+
         // COM indexed-member check: obj.Member(i) → obj.Member[i]
         // Applies when the receiver's declared type and member name are in ComTypeMap
         // (e.g. ADODB.Recordset.Fields, DAO.Recordset.Fields, …).
@@ -894,14 +914,20 @@ public sealed class CodeGenerator
                 return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
         }
 
-        // Array-typed variable access: myArr(i) → myArr[i]
-        // Applies when the target is a local or field variable whose inferred/declared type
-        // is an array (ends with "[]"), e.g. after Variant→string[] inference.
+        // Array-typed / List<T> / Dictionary<string,T> variable access: col(i) → col[i] or col[i-1]
+        // Applies when the target is a variable whose type is an array, List<T>, or Dictionary<string,T>.
         if (c.Arguments.Count > 0)
         {
             string? targetType = TryGetSimpleType(c.Target);
-            if (targetType != null && targetType.EndsWith("[]"))
-                return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+            if (targetType != null)
+            {
+                if (targetType.EndsWith("[]"))
+                    return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+                if (targetType.StartsWith("List<", StringComparison.OrdinalIgnoreCase))
+                    return $"{Expr(c.Target)}[{Args(c.Arguments)} - 1] /* 1-based */";
+                if (targetType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase))
+                    return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+            }
         }
 
         // General call
@@ -1130,6 +1156,88 @@ public sealed class CodeGenerator
             foreach (var child in children)
                 CollectAssignmentsToVar(varName, child, localTypeRefs, assignedTypes);
         }
+    }
+
+    /// <summary>
+    /// Translates VB6 Collection/List/Dictionary member calls to their C# equivalents.
+    /// Handles the three most important members:
+    /// <list type="bullet">
+    ///   <item><b>Add</b>: VB6 <c>col.Add item, key</c> → <c>dict.Add(key, item)</c> /
+    ///         <c>list.Add(item)</c> / <c>col.Add(item) /* REVIEW */</c></item>
+    ///   <item><b>Item</b>: VB6 <c>col.Item(x)</c> → <c>dict[x]</c> / <c>list[x - 1]</c></item>
+    ///   <item><b>Remove</b>: VB6 <c>col.Remove x</c> → <c>dict.Remove(x)</c> / <c>list.RemoveAt(x - 1)</c></item>
+    /// </list>
+    /// Returns null when the receiver is not a recognized collection type or the member
+    /// does not need special handling.
+    /// </summary>
+    private string? TryMapCollectionMember(
+        ExpressionNode receiver,
+        string memberName,
+        IReadOnlyList<ArgumentNode> args)
+    {
+        string? receiverType = TryGetSimpleType(receiver);
+        if (receiverType == null) return null;
+
+        bool isDict = receiverType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase);
+        bool isList = receiverType.StartsWith("List<", StringComparison.OrdinalIgnoreCase);
+        bool isColl = receiverType.StartsWith("Collection<", StringComparison.OrdinalIgnoreCase);
+
+        if (!isDict && !isList && !isColl) return null;
+
+        string receiverCs = Expr(receiver);
+
+        // ── Add ────────────────────────────────────────────────────────────────
+        if (memberName.Equals("Add", StringComparison.OrdinalIgnoreCase))
+        {
+            var nonMissing = args.Where(a => !a.IsMissing).ToList();
+            if (nonMissing.Count == 0) return null; // nothing to add
+
+            string itemCs = Expr(nonMissing[0].Value!);
+            bool hasKey   = nonMissing.Count >= 2 && nonMissing[1].Value != null;
+            string keyCs  = hasKey ? Expr(nonMissing[1].Value!) : "";
+            bool hasExtra = nonMissing.Count > 2; // before/after arguments
+            string extraCmt = hasExtra ? " /* VB6 before/after args dropped */" : "";
+
+            if (isDict)
+            {
+                if (hasKey)
+                    return $"{receiverCs}.Add({keyCs}, {itemCs}){extraCmt}";
+                // Dictionary without a key — can't add without key; emit TODO
+                return $"{receiverCs}.Add(/* key missing */ \"\", {itemCs}) /* REVIEW: VB6 Add had no key — supply a unique key */{extraCmt}";
+            }
+
+            if (isList)
+            {
+                string dropped = hasKey ? $" /* key {keyCs} dropped */" : "";
+                return $"{receiverCs}.Add({itemCs}){dropped}{extraCmt}";
+            }
+
+            // Collection<T> — 2-arg form doesn't compile in C#; emit REVIEW
+            if (hasKey)
+                return $"{receiverCs}.Add({itemCs}) /* REVIEW: VB6 key arg ({keyCs}) — consider Dictionary<string, T> */{extraCmt}";
+
+            return null; // single-arg Add on Collection<T> is fine; let normal emission handle it
+        }
+
+        // ── Item ───────────────────────────────────────────────────────────────
+        if (memberName.Equals("Item", StringComparison.OrdinalIgnoreCase) && args.Count > 0 && !args[0].IsMissing)
+        {
+            string indexCs = Expr(args[0].Value!);
+            if (isDict) return $"{receiverCs}[{indexCs}]";
+            if (isList) return $"{receiverCs}[{indexCs} - 1] /* 1-based */";
+            return null;
+        }
+
+        // ── Remove ─────────────────────────────────────────────────────────────
+        if (memberName.Equals("Remove", StringComparison.OrdinalIgnoreCase) && args.Count > 0 && !args[0].IsMissing)
+        {
+            string indexCs = Expr(args[0].Value!);
+            if (isDict) return $"{receiverCs}.Remove({indexCs})";
+            if (isList) return $"{receiverCs}.RemoveAt({indexCs} - 1) /* 1-based */";
+            return null;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -1558,6 +1666,8 @@ public sealed class CodeGenerator
 
         if (name.StartsWith("Collection<"))
             _requiredUsings.Add("System.Collections.ObjectModel");
+        if (name.StartsWith("Dictionary<") || name.StartsWith("List<"))
+            _requiredUsings.Add("System.Collections.Generic");
 
         // Arrays
         if (t.IsArray)

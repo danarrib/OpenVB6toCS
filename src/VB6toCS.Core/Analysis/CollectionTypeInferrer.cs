@@ -39,6 +39,12 @@ public sealed class CollectionTypeInferrer
     // Keys that received conflicting types from different sites — excluded from results.
     private readonly HashSet<(string, string)> _conflicted = new();
 
+    // For each (module, field) that received at least one Add call:
+    //   _keyedAdds    — had at least one Add with a non-missing key argument (arg[1])
+    //   _unkeyedAdds  — had at least one Add without a key argument
+    private readonly HashSet<(string, string)> _keyedAdds   = new();
+    private readonly HashSet<(string, string)> _unkeyedAdds = new();
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     /// <summary>Run all inference passes on the full set of Stage-3 modules.</summary>
@@ -92,6 +98,31 @@ public sealed class CollectionTypeInferrer
     /// </summary>
     public string? GetElementType(string moduleName, string fieldName) =>
         _resolvedTypes.TryGetValue((moduleName, fieldName), out var t) ? t : null;
+
+    /// <summary>
+    /// Returns a map from (moduleName, fieldName) to the inferred <see cref="CollectionKind"/>
+    /// for every Collection field/property where Add usage was observed.
+    /// Fields with mixed key/no-key usage are omitted (they default to <see cref="CollectionKind.Collection"/>).
+    /// </summary>
+    public IReadOnlyDictionary<(string, string), CollectionKind> GetInferredKinds()
+    {
+        var result = new Dictionary<(string, string), CollectionKind>();
+        var allKeys = new HashSet<(string, string)>(_keyedAdds);
+        allKeys.UnionWith(_unkeyedAdds);
+
+        foreach (var key in allKeys)
+        {
+            bool keyed   = _keyedAdds.Contains(key);
+            bool unkeyed = _unkeyedAdds.Contains(key);
+
+            if (keyed && !unkeyed)
+                result[key] = CollectionKind.Dictionary;
+            else if (!keyed) // unkeyed only
+                result[key] = CollectionKind.List;
+            // Mixed (keyed && unkeyed) → omit; defaults to Collection at the call site
+        }
+        return result;
+    }
 
     // ── Add-call scanning (Pass 2) ────────────────────────────────────────────
 
@@ -209,6 +240,13 @@ public sealed class CollectionTypeInferrer
         if (!_hits.TryGetValue(key, out var set))
             _hits[key] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         set.Add(elemType);
+
+        // Track whether this Add call includes a string key (second argument).
+        bool hasKeyArg = addArgs.Count >= 2 &&
+                         !addArgs[1].IsMissing &&
+                         addArgs[1].Value != null;
+        if (hasKeyArg) _keyedAdds.Add(key);
+        else           _unkeyedAdds.Add(key);
     }
 
     // ── Local Collection element-type pre-pass ────────────────────────────────

@@ -172,10 +172,12 @@ static int RunProject(string vbpPath, CliOptions options)
 
     // ── Cross-module Collection type inference (between stages 3 and 4) ───────
     IReadOnlyDictionary<(string, string), string> collectionTypeMap;
+    IReadOnlyDictionary<(string, string), VB6toCS.Core.Analysis.CollectionKind> collectionKindMap;
     {
         var inferrer = new CollectionTypeInferrer();
         inferrer.Analyse(stage3List.Select(r => r.Module));
         collectionTypeMap = inferrer.GetInferredTypes();
+        collectionKindMap = inferrer.GetInferredKinds();
     }
 
     // ── Cross-module enum member map (used by code generator for qualification) ─
@@ -189,7 +191,7 @@ static int RunProject(string vbpPath, CliOptions options)
 
     foreach (var (src, module3) in stage3List)
     {
-        var transformer = new Transformer(collectionTypeMap);
+        var transformer = new Transformer(collectionTypeMap, collectionKindMap);
         var module = transformer.Transform(module3);
         foreach (var d in transformer.Diagnostics)
             Console.WriteLine($"  [WARN    ] {src.Name}  — {d}");
