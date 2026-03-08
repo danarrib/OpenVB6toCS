@@ -411,16 +411,26 @@ public sealed class CodeGenerator
                 break;
 
             case FunctionReturnNode r:
+            {
+                string rVal = Expr(r.Value);
+                if (IsFieldsCallNode(r.Value) && returnType != null)
+                    rVal = WrapObjectConversion(rVal, returnType) ?? rVal;
                 if (resultVar != null)
-                    _w.WriteLine($"{resultVar} = {Expr(r.Value)};");
+                    _w.WriteLine($"{resultVar} = {rVal};");
                 else
-                    _w.WriteLine($"return {Expr(r.Value)};");
+                    _w.WriteLine($"return {rVal};");
                 break;
+            }
 
             case AssignmentNode a:
+            {
                 // Drop "Set" keyword — object assignment is the same in C#
-                _w.WriteLine($"{Expr(a.Target)} = {Expr(a.Value)};");
+                string rhs = Expr(a.Value);
+                if (IsFieldsCallNode(a.Value))
+                    rhs = WrapObjectConversion(rhs, TryGetSimpleType(a.Target)) ?? rhs;
+                _w.WriteLine($"{Expr(a.Target)} = {rhs};");
                 break;
+            }
 
             case CallStatementNode c:
                 // Statement-form Collection.Add: col.Add item, key (target is bare MemberAccess, not wrapped in CallOrIndex)
@@ -1478,6 +1488,58 @@ public sealed class CodeGenerator
         type is "int" or "long" or "double" or "float" or "decimal" or "byte";
 
     /// <summary>
+    /// Returns true when <paramref name="e"/> will emit as a call to a method named "Fields"
+    /// that returns <c>object</c>. Covers two patterns:
+    /// <list type="bullet">
+    ///   <item>Explicit: <c>rst.Fields("key")</c> — CallOrIndexNode with MemberAccessNode("Fields") target.</item>
+    ///   <item>Default-member: <c>rst("key")</c> where rst's type has "Fields" as its default member.</item>
+    /// </list>
+    /// </summary>
+    private bool IsFieldsCallNode(ExpressionNode e)
+    {
+        if (e is not CallOrIndexNode c || c.Arguments.Count == 0) return false;
+
+        // Explicit rst.Fields("key")
+        if (c.Target is MemberAccessNode m &&
+            m.MemberName.Equals("Fields", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Default-member rst("key") where default member is Fields
+        if (c.Target is IdentifierNode id && _defaultMemberMap != null)
+        {
+            string? varType = _procTypes.TryGetValue(id.Name, out var t1) ? t1
+                            : _moduleFieldTypes.TryGetValue(id.Name, out var t2) ? t2 : null;
+            if (varType != null &&
+                _defaultMemberMap.TryGetValue(varType, out var defMember) &&
+                defMember.Equals("Fields", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Wraps a C# expression in the appropriate <c>Convert.To*()</c> call when
+    /// <paramref name="targetType"/> is a concrete non-object type, so that
+    /// <c>object</c>-returning methods (e.g. Fields("key")) compile in typed contexts.
+    /// Returns null when no conversion is needed (type unknown or already object).
+    /// </summary>
+    private static string? WrapObjectConversion(string expr, string? targetType) =>
+        targetType switch
+        {
+            "int"      => $"Convert.ToInt32({expr})",
+            "long"     => $"Convert.ToInt64({expr})",
+            "double"   => $"Convert.ToDouble({expr})",
+            "float"    => $"Convert.ToSingle({expr})",
+            "decimal"  => $"Convert.ToDecimal({expr})",
+            "bool"     => $"Convert.ToBoolean({expr})",
+            "byte"     => $"Convert.ToByte({expr})",
+            "string"   => $"Convert.ToString({expr})",
+            "DateTime" => $"Convert.ToDateTime({expr})",
+            _          => null,
+        };
+
+    /// <summary>
     /// Infers the best C# type for a const declaration.
     /// When the declared type is object/Variant (or absent), falls back to the
     /// literal value type — C# forbids "const object = nonNull".
@@ -1620,6 +1682,12 @@ public sealed class CodeGenerator
                 right = NumericToString(b.Right, right);
             else if (rightType == "string" && IsNumericCsType(leftType))
                 left  = NumericToString(b.Left, left);
+
+            // Fields("key") returns object — add explicit conversion based on the other operand's type.
+            if (IsFieldsCallNode(b.Left) && !IsFieldsCallNode(b.Right))
+                left  = WrapObjectConversion(left,  rightType ?? TryGetSimpleType(b.Right)) ?? left;
+            else if (IsFieldsCallNode(b.Right) && !IsFieldsCallNode(b.Left))
+                right = WrapObjectConversion(right, leftType  ?? TryGetSimpleType(b.Left))  ?? right;
         }
 
         // VB6 date arithmetic: Date ± n means add/subtract days.
