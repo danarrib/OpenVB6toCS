@@ -374,31 +374,26 @@ public sealed class Transformer
     private TypeRefNode ResolveCollectionType(TypeRefNode t, string name, bool isField)
     {
         string? elemType = null;
-        CollectionKind kind = CollectionKind.Collection;
+        CollectionKind kind = CollectionKind.Dictionary; // default: Dictionary unless inferred as List
 
         if (isField && _collectionTypes != null)
             _collectionTypes.TryGetValue((_currentModuleName, name), out elemType);
         if (isField && _collectionKinds != null)
             _collectionKinds.TryGetValue((_currentModuleName, name), out kind);
+        // Non-fields (locals, parameters): no Add-call data available → keep default Dictionary
 
         string elem = elemType ?? "object";
 
-        switch (kind)
-        {
-            case CollectionKind.Dictionary:
-                return t with { TypeName = $"Dictionary<string, {elem}>" };
+        if (kind == CollectionKind.List)
+            return t with { TypeName = $"List<{elem}>" };
 
-            case CollectionKind.List:
-                return t with { TypeName = $"List<{elem}>" };
-
-            default: // Collection or unknown
-                if (elemType == null)
-                    Warn(_currentContext,
-                        $"'{name}' is a Collection whose element type could not be inferred; " +
-                        "translated to Collection<object>. Consider replacing with List<T> or Dictionary<string, T>.",
-                        t.Line, t.Column);
-                return t with { TypeName = $"Collection<{elem}>" };
-        }
+        // Dictionary (explicit or default)
+        if (elemType == null)
+            Warn(_currentContext,
+                $"'{name}' is a Collection whose element type could not be inferred; " +
+                "translated to Dictionary<string, object>. Review key and value types.",
+                t.Line, t.Column);
+        return t with { TypeName = $"Dictionary<string, {elem}>" };
     }
 
     // ── Diagnostic helpers ───────────────────────────────────────────────────

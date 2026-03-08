@@ -1683,8 +1683,8 @@ public sealed class CodeGenerator
     /// or null when no review is needed.
     /// </summary>
     private static string? ReviewComment(TypeRefNode? t) =>
-        t?.TypeName == "Collection<object>"
-            ? " // REVIEW: Collection<object> — replace with List<T> or Dictionary<string, T> once element type is known"
+        t?.TypeName == "Dictionary<string, object>"
+            ? " // REVIEW: Dictionary<string, object> — element type could not be inferred; specify value type"
             : null;
 
     /// <summary>

@@ -112,14 +112,11 @@ public sealed class CollectionTypeInferrer
 
         foreach (var key in allKeys)
         {
-            bool keyed   = _keyedAdds.Contains(key);
-            bool unkeyed = _unkeyedAdds.Contains(key);
-
-            if (keyed && !unkeyed)
-                result[key] = CollectionKind.Dictionary;
-            else if (!keyed) // unkeyed only
-                result[key] = CollectionKind.List;
-            // Mixed (keyed && unkeyed) → omit; defaults to Collection at the call site
+            // List only when every observed Add call had no key argument.
+            // Dictionary for always-keyed AND mixed (keyed + unkeyed) calls.
+            result[key] = _unkeyedAdds.Contains(key) && !_keyedAdds.Contains(key)
+                ? CollectionKind.List
+                : CollectionKind.Dictionary;
         }
         return result;
     }
@@ -230,7 +227,9 @@ public sealed class CollectionTypeInferrer
             itemArg.Value is IdentifierNode itemId &&
             localCollElemTypes.TryGetValue(itemId.Name, out var innerElem))
         {
-            elemType = $"Collection<{innerElem}>";
+            // Local Collection variables are now translated to Dictionary<string,T> by default,
+            // so represent the nested element type accordingly.
+            elemType = $"Dictionary<string, {innerElem}>";
         }
 
         var target = ResolveCollectionTarget(addMa.Object, moduleName, locals, withStack);
