@@ -129,6 +129,7 @@ src/
     CodeGeneration/
       CodeWriter.cs       ← indentation-aware line writer
       BuiltInMap.cs       ← VB6 built-in functions/constants → C# mapping table
+      ComTypeMap.cs       ← static lookup: known COM indexed-member + ByRef parameter info
       CodeGenerator.cs    ← Stage 5: AST → C# source text
     Projects/
       VbProject.cs        ← data model (VbProject, VbSourceFile, VbComReference, VbSkippedFile)
@@ -165,10 +166,21 @@ CLAUDE.md                 ← this file
   (2) error handling restructuring (`On Error GoTo` → `TryCatchNode`).
   Validated against `D46O003_1080.vbp`: all 137 files pass Stage 4 with 33 diagnostics
   (all flagging real patterns that need human review).
-- **Stage 5 (C# Code Generation): complete.** `CodeGenerator.cs` + `BuiltInMap.cs` in `VB6toCS.Core/CodeGeneration/`.
-  Full C# output for all VB6 constructs. Three cross-module maps built in `Program.cs` between
-  Stages 4 and 5: `collectionTypeMap`, `enumMemberMap`, `enumTypedFieldNames`.
+- **Stage 5 (C# Code Generation): complete.** `CodeGenerator.cs` + `BuiltInMap.cs` + `ComTypeMap.cs` in `VB6toCS.Core/CodeGeneration/`.
+  Full C# output for all VB6 constructs. Five cross-module maps built in `Program.cs` between
+  Stages 4 and 5: `collectionTypeMap`, `enumMemberMap`, `enumTypedFieldNames`, `methodParamMap`, `globalVarMap`.
   Validated against `D46O003_1080.vbp`: all 137 files translated, `.cs` files written.
+  Post-release enhancements applied (all validated against D46O003_1080.vbp):
+  - `ref` keyword emission at call sites for `ByRef` parameters (cross-module `methodParamMap`).
+  - COM indexed-member disambiguation: `pRs.Fields(i)` → `pRs.Fields[i]` via `ComTypeMap`.
+  - Type-aware string coercion for `Left`/`Right`/`Mid`/`InStr`/`Len` (`.ToString()` on non-string args).
+  - VB6 date arithmetic: `Date - 60` → `DateTime.Now.Date.AddDays(-60)`.
+  - `IsMissing(x)` → `(x == null)` or `(x == default)` based on parameter type.
+  - `ReDim arr(n) As T` → `arr = new T[n]` (dimension expression now captured by parser).
+  - Function return-type inference: functions declared `As Variant` (→ `object`) whose body
+    consistently returns a single known type are emitted with that inferred type instead.
+  - `CollectionTypeInferrer` extended to infer element types through local `Collection`
+    intermediates (e.g. `registros` correctly typed as `Collection<Collection<clsYasField>>`).
 - **Stage 6 (Roslyn formatting): not yet implemented.**
 
 ## How to run
@@ -195,13 +207,15 @@ These are critical decisions encoded in `CodeGenerator.cs`. Do not change them w
 
 ### Cross-module maps (built in `Program.cs` between Stages 4 and 5)
 
-Three maps are built from all Stage-3 ASTs and passed to `CodeGenerator.Generate()`:
+Five maps are built from all Stage-3 ASTs and passed to `CodeGenerator.Generate()`:
 
 | Map | Type | Purpose |
 |---|---|---|
 | `collectionTypeMap` | `IReadOnlyDictionary<(string module, string field), string elemType>` | Element type for `Collection<T>` fields, inferred by `CollectionTypeInferrer` |
 | `enumMemberMap` | `IReadOnlyDictionary<string memberName, (string module, string enumName)>` | Qualifies bare enum member identifiers at emit time; ambiguous names excluded |
 | `enumTypedFieldNames` | `IReadOnlySet<string>` | Field/property/UDT-field names whose declared type is an enum; suppresses `(int)` casts in same-enum comparisons |
+| `methodParamMap` | `IReadOnlyDictionary<string moduleName, IReadOnlyDictionary<string methodName, IReadOnlyList<ParameterMode>>>` | Parameter modes for every Sub/Function/Property in every module; used to emit `ref` at call sites |
+| `globalVarMap` | `IReadOnlyDictionary<string fieldName, string typeName>` | Public field names → declared type across all modules; used for cross-module type resolution in `TryResolveProcParamModes` |
 
 ### Enum emission rules
 
@@ -244,6 +258,32 @@ ReturnType _result = default;
 return _result;
 ```
 `Exit Function/Sub/Property` inside a getter → `return _result;`; inside a void Sub → `return;`.
+
+### `ref` parameter emission at call sites
+
+`ArgsWithRef(args, modes)` in `CodeGenerator` prepends `ref` to each argument whose matching parameter is declared `ByRef` in `methodParamMap`. `TryResolveProcParamModes(target)` resolves the parameter list for a call target by:
+1. Checking the current module's own methods (bare identifier calls).
+2. Checking all other modules (unqualified cross-module calls).
+3. For `obj.Method(...)` member-access calls: looking up `obj`'s declared type in `_procTypes` → `_moduleFieldTypes` → `globalVarMap`, then finding that type's method in `methodParamMap`.
+
+`_moduleFieldTypes` includes both `FieldNode` declarators **and** `CsPropertyNode` return types, so property-typed variables (e.g. `M46V999` of type `clsM46V999`) resolve correctly.
+
+### COM indexed-member disambiguation
+
+`ComTypeMap.cs` contains a static `HashSet<(ownerType, memberName)>` of COM members that are indexed collections rather than methods. When `MapCall` encounters `CallOrIndexNode(MemberAccessNode(obj, member), [args])`, it calls `ComTypeMap.IsIndexedMember(receiverType, member)` (type from `TryGetSimpleType`). If matched, `[args]` is emitted instead of `(args)`.
+
+Type names are matched case-insensitively, trying both the fully-qualified form (`ADODB.Recordset`) and the unqualified form (`Recordset`). Add new entries to `ComTypeMap.IndexedMembers` as new COM libraries are encountered. See ROADMAP.md Stage 5c for the planned `.tlb` reader that will replace this static table.
+
+### ReDim statement
+
+`ReDimNode` carries a `DimensionLists` init-property (`IReadOnlyList<IReadOnlyList<ExpressionNode>>`), one inner list per declarator. The parser populates it via `ParseReDimDeclarator` + `ParseReDimDimension`:
+- `ReDim arr(n)` → dimension `[n]` → `arr = new T[n]`
+- `ReDim arr(lb To ub)` → lower bound dropped, dimension `[ub]` → `arr = new T[ub]`  (C# arrays are always 0-based)
+- `ReDim arr(n1, n2)` → two dimensions → `arr = new T[n1, n2]`
+
+### Function return-type inference
+
+`InferActualReturnType(parameters, body, declaredType)` in `CodeGenerator` fires only when `declaredType == "object"` (the result of `Variant` → `object` normalization). It pre-scans the full body with `CollectBodyTypeRefs` to build a complete locals map, then collects every `FunctionReturnNode` value with `CollectReturnValues`. If all returned expressions are identifiers whose `TypeRef` resolves to the same C# type via `TypeStr`, that type replaces `object` in both the method signature and the `_result` local declaration.
 
 ### Built-in functions and constants
 

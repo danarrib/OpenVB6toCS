@@ -381,6 +381,129 @@ Collected lazily during generation into `_requiredUsings` and prepended to the f
 After all files are generated, emit the SDK-style `.csproj`. Runs once per project.
 Implemented in `VB6toCS.Core/Projects/CsprojWriter.cs`.
 
+### Stage 5c: COM Type Library Reader (`.tlb` parser)
+
+> **Status: planned**
+
+#### Motivation
+
+The current `ComTypeMap.cs` is a hand-maintained static table that covers the handful of COM libraries present in the integration test target (`ADODB`, `DAO`, `MSXML`, `Scripting`). It solves two known problems:
+
+1. **Index vs. call disambiguation** — `pRs.Fields(i)` is a VB6 indexed property access, not a function call, so it must emit `pRs.Fields[i]` in C#.
+2. **Parameter mode resolution** — cross-module `ref` annotations require knowing which COM parameters are `ByRef`.
+
+Any COM library not in the table falls through to function-call syntax and loses `ref` qualifiers. The fix is to read the actual COM type library (`.tlb`) file, which is the authoritative metadata source for every COM interface — the same data that `tlbimp.exe` uses to generate interop assemblies.
+
+#### What a `.tlb` file contains
+
+A `.tlb` (OLE Automation Type Library) is a binary file described by the Microsoft OLE specification. Its `ITypeLib`/`ITypeInfo` COM interfaces expose:
+
+| Metadata | Used for |
+|---|---|
+| Interface and coclass names | Type name resolution |
+| Method names + parameter names | Cross-module call disambiguation |
+| Parameter types (`VT_*` variant types) | `ByVal`/`ByRef` emission, return-type inference |
+| `[out]`, `[in,out]` PARAMFLAG bits | `ref`/`out` keyword selection |
+| Property flags (`INVOKE_PROPERTYGET`, `INVOKE_PROPERTYPUT`) | Getter vs. setter distinction |
+| `FUNCFLAG_FRESTRICTED` / `VARFLAG_FHIDDEN` | Skip internal implementation details |
+| `[defaultvalue]` / `[optional]` | Optional parameter handling |
+| Default members (`FUNCFLAG_FDEFAULTBIND` or `DISPID_VALUE = 0`) | Bang-access and default-member expansion |
+| Indexer markers (`INVOKE_FUNC` on a property returning a collection) | `[]` vs `()` disambiguation |
+
+The `.vbp` `Reference=` line already gives us the `.tlb` path:
+```
+Reference=*\G{GUID}#2.0#0#C:\Program Files\Common Files\System\ado\msado15.dll#Microsoft ActiveX Data Objects 2.0 Library
+```
+
+The path (`msado15.dll`) may be a `.dll` with an embedded type library resource or a standalone `.tlb` / `.olb` file.
+
+#### Approach
+
+**Phase 1 — Windows COM API reader (primary path)**
+
+Use `LoadTypeLib` / `ITypeLib` / `ITypeInfo` COM interfaces via P/Invoke or a thin C# COM-interop wrapper. This is the simplest correct implementation because the OS already knows how to parse every `.tlb` format variant:
+
+```csharp
+// VB6toCS.Core/TypeLibraries/TlbReader.cs
+public sealed class TlbReader
+{
+    // Loads a .tlb or embedded type library from a .dll path.
+    // Returns null if the path is inaccessible (non-Windows, file not found).
+    public static ComTypeLibrary? TryLoad(string path) { ... }
+}
+```
+
+Returns a `ComTypeLibrary` record with:
+```csharp
+public sealed record ComTypeLibrary(
+    string LibraryName,
+    IReadOnlyDictionary<string, ComTypeInfo> Types);    // typeName (ci) → type info
+
+public sealed record ComTypeInfo(
+    string Name,
+    ComTypeKind Kind,                                   // Interface, Dispatch, CoClass, Enum, …
+    IReadOnlyDictionary<string, ComMemberInfo> Members);
+
+public sealed record ComMemberInfo(
+    string Name,
+    ComMemberKind Kind,                                 // Method, PropertyGet, PropertyPut, PropertyPutRef
+    bool IsDefaultMember,
+    bool IsIndexed,                                     // DISPID_VALUE with parameters → indexer
+    IReadOnlyList<ComParamInfo> Parameters,
+    string? ReturnTypeName);                            // mapped to C# type name, null if unresolvable
+
+public sealed record ComParamInfo(
+    string Name,
+    string TypeName,                                    // C# type name
+    bool IsOut,
+    bool IsRef);
+```
+
+**Phase 2 — Cache / descriptor files (portability)**
+
+To support running the translator on Linux (e.g. in CI), cache the parsed metadata as a JSON descriptor file alongside the `.tlb`:
+
+```
+msado15.tlb.vb6tocs.json
+```
+
+If the JSON cache exists and is newer than the `.tlb`, use it directly. This means the type library only needs to be read once on a Windows machine; the cache travels with the project.
+
+**Phase 3 — Binary `.tlb` parser (optional, cross-platform)**
+
+A pure-C# binary parser for the SLTG / MSFT `.tlb` formats (both documented in the Open Specifications). This eliminates the Windows dependency entirely. More complex to implement; defer until the COM API + cache approach proves insufficient.
+
+#### Integration with the pipeline
+
+The `.tlb` reader runs **between Stage 0 (VbpReader) and Stage 2 (Parser)**, before any AST work:
+
+```
+VbpReader → TlbReader (one per Reference= entry) → build ComTypeRegistry → Stages 1–5
+```
+
+The `ComTypeRegistry` (keyed by type name, case-insensitive) is passed to:
+
+1. **`ComTypeMap`** (Stage 5, CodeGenerator) — replaces the static `IndexedMembers` set with a live lookup. `IsIndexedMember(ownerType, memberName)` queries the registry first; falls back to the static table if the type is not in the registry (e.g. COM reference path not found).
+
+2. **`BuildMethodParamMap`** (Program.cs, between Stages 4 and 5) — currently only covers project-internal methods. Extended to also include COM methods from the registry, so cross-COM `ref` parameters are emitted correctly.
+
+3. **`TryGetSimpleType`** (CodeGenerator) — currently resolves only declared-type identifiers. With COM metadata, `pRs.Fields[i]` can be resolved to `ADODB.Field`, enabling further chained type lookups.
+
+4. **`CollectionTypeInferrer`** — currently only uses declared VB6 types for `.Add()` site inference. With COM metadata, `rs.Fields[i]` can be typed as `ADODB.Field`, enabling the inferrer to resolve more element types.
+
+#### Known limitations
+
+- **Path resolution**: the path in `Reference=` is the path on the machine where the VB6 project was last built. It is often a Windows absolute path (`C:\Program Files\...`) that does not exist on the translation machine. The tool must gracefully fall back to the static `ComTypeMap` when the `.tlb` path is not accessible.
+- **Variant types**: many COM methods use `VARIANT` (`VT_VARIANT`) for parameters, which maps to `object` — no better than the current situation. Inference still applies.
+- **Late binding**: VB6 code using `Dim x As Object` and late-binding COM calls cannot be typed statically regardless of `.tlb` metadata.
+- **COM redirection**: some COM libraries register type libraries in the Windows Registry separately from the path in `.vbp`. A registry fallback lookup (`HKEY_CLASSES_ROOT\TypeLib\{GUID}\version`) may be needed.
+
+#### Build order position
+
+This is an enhancement to the existing pipeline, not a new stage. It slots between Stage 0 and Stage 1 in the build order and improves output quality at Stage 5. It should be implemented after Stage 6 (Roslyn formatting) since it has no dependencies on later stages.
+
+---
+
 ### Stage 6: Post-Processing / Formatting
 Run output through Roslyn's formatter for clean, idiomatic C#. Roslyn's analyzer flags anything that needs manual review.
 
@@ -407,6 +530,7 @@ Run output through Roslyn's formatter for clean, idiomatic C#. Roslyn's analyzer
 8. ~~C# code generator (AST → C# source text)~~ ✅
 9. ~~CsprojWriter — generate `.csproj`~~ ✅
 10. Roslyn formatter + "needs manual review" annotation system
+11. COM `.tlb` type library reader — dynamic `ComTypeMap` + `ref`/`out` resolution for arbitrary COM references
 
 ---
 

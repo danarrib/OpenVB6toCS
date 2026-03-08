@@ -22,6 +22,19 @@ public sealed class CodeGenerator
     // Used to suppress the (int) cast when both sides of a comparison are enum-typed.
     private readonly IReadOnlySet<string>? _enumTypedFieldNames;
 
+    // Cross-module default member map: className → defaultMemberName (VB_UserMemId = 0).
+    // Used to expand VB6 default member calls: obj(arg) → obj.DefaultMember(arg).
+    private readonly IReadOnlyDictionary<string, string>? _defaultMemberMap;
+
+    // Cross-module method parameter mode map: moduleName → (methodName → [ParameterMode, ...]).
+    // Used to emit `ref` at call sites for ByRef parameters.
+    private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? _methodParamMap;
+
+    // Cross-module global variable map: publicFieldName → typeName (collected from all modules).
+    // Used to resolve qualified calls like `M46V999.gfObtSYASMULTINI` where M46V999 is a
+    // public field declared in another module (not in the current local/module scope).
+    private readonly IReadOnlyDictionary<string, string>? _globalVarMap;
+
     private string _currentModuleName = "";
 
     // Type scope for implicit-coercion detection.
@@ -32,18 +45,27 @@ public sealed class CodeGenerator
 
     private CodeGenerator(bool isStatic,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
-        IReadOnlySet<string>? enumTypedFieldNames)
+        IReadOnlySet<string>? enumTypedFieldNames,
+        IReadOnlyDictionary<string, string>? defaultMemberMap,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap,
+        IReadOnlyDictionary<string, string>? globalVarMap)
     {
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
         _enumTypedFieldNames = enumTypedFieldNames;
+        _defaultMemberMap = defaultMemberMap;
+        _methodParamMap = methodParamMap;
+        _globalVarMap = globalVarMap;
     }
 
     public static string Generate(ModuleNode module, bool isStaticModule,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap = null,
-        IReadOnlySet<string>? enumTypedFieldNames = null)
+        IReadOnlySet<string>? enumTypedFieldNames = null,
+        IReadOnlyDictionary<string, string>? defaultMemberMap = null,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap = null,
+        IReadOnlyDictionary<string, string>? globalVarMap = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -64,13 +86,19 @@ public sealed class CodeGenerator
     {
         _currentModuleName = module.Name;
 
-        // Collect module-level field types for implicit-coercion detection in comparisons.
+        // Collect module-level field and property types for type-aware code generation.
         _moduleFieldTypes.Clear();
         foreach (var member in module.Members)
+        {
             if (member is FieldNode f)
                 foreach (var d in f.Declarators)
                     if (d.TypeRef != null)
                         _moduleFieldTypes[d.Name] = d.TypeRef.TypeName;
+            // Note: CsPropertyNode pattern match fails with stale obj; use explicit cast
+            var csP = member as CsPropertyNode;
+            if (csP?.Type != null)
+                _moduleFieldTypes[csP.Name] = csP.Type.TypeName;
+        }
 
         string staticKw  = _isStatic ? "static " : "";
         string baseClause = module.Implements.Count > 0
@@ -165,8 +193,9 @@ public sealed class CodeGenerator
 
     private void GenerateFunction(FunctionNode f)
     {
-        string staticKw  = _isStatic || f.IsStatic ? "static " : "";
+        string staticKw   = _isStatic || f.IsStatic ? "static " : "";
         string returnType = TypeStr(f.ReturnType, f.Name);
+        returnType = InferActualReturnType(f.Parameters, f.Body, returnType);
         _w.WriteLine($"{Access(f.Access)}{staticKw}{returnType} {f.Name}({Params(f.Parameters)})");
         _w.OpenBrace();
         EnterProcScope(f.Parameters);
@@ -176,6 +205,18 @@ public sealed class CodeGenerator
 
     private void GenerateProperty(CsPropertyNode p)
     {
+        // Parameterized properties cannot be represented as C# properties.
+        // A Property Get with parameters, or a Let/Set with more than one parameter
+        // (the extra ones beyond the value), must become methods.
+        bool getHasParams  = p.GetBody  != null && p.GetParameters.Count  > 0;
+        bool letHasExtra   = p.LetBody  != null && p.LetParameters.Count  > 1;
+        bool setHasExtra   = p.SetBody  != null && p.SetParameters.Count  > 1;
+        if (getHasParams || letHasExtra || setHasExtra)
+        {
+            GenerateParameterizedPropertyAsMethods(p);
+            return;
+        }
+
         string staticKw  = _isStatic || p.IsStatic ? "static " : "";
         string propType  = TypeStr(p.Type, p.Name);
         _w.WriteLine($"{Access(p.Access)}{staticKw}{propType} {p.Name}");
@@ -215,6 +256,47 @@ public sealed class CodeGenerator
         _w.CloseBrace();
     }
 
+    /// <summary>
+    /// Emits a VB6 Property Get/Let/Set that has extra parameters as one or more C# methods.
+    /// C# properties cannot have parameters; Property Get with params becomes a getter method,
+    /// Property Let/Set with extra params becomes a setter method.
+    /// </summary>
+    private void GenerateParameterizedPropertyAsMethods(CsPropertyNode p)
+    {
+        string staticKw = _isStatic || p.IsStatic ? "static " : "";
+        string propType = TypeStr(p.Type, p.Name);
+        _w.WriteLine("// This was a VB6 Property with parameters. C# properties cannot have parameters;");
+        _w.WriteLine("// converted to method(s). Consider implementing as an indexer (this[...]) if appropriate.");
+
+        if (p.GetBody != null)
+        {
+            EnterProcScope(p.GetParameters);
+            _w.WriteLine($"{Access(p.Access)}{staticKw}{propType} {p.Name}({Params(p.GetParameters)})");
+            _w.OpenBrace();
+            GenerateBodyWithReturn(p.GetBody, propType);
+            _w.CloseBrace();
+        }
+
+        if (p.LetBody != null)
+        {
+            EnterProcScope(p.LetParameters);
+            // All parameters including the trailing value parameter
+            _w.WriteLine($"{Access(p.Access)}{staticKw}void {p.Name}({Params(p.LetParameters)})  // Property Let");
+            _w.OpenBrace();
+            GenerateBody(p.LetBody, returnType: null);
+            _w.CloseBrace();
+        }
+
+        if (p.SetBody != null)
+        {
+            EnterProcScope(p.SetParameters);
+            _w.WriteLine($"{Access(p.Access)}{staticKw}void {p.Name}({Params(p.SetParameters)})  // Property Set");
+            _w.OpenBrace();
+            GenerateBody(p.SetBody, returnType: null);
+            _w.CloseBrace();
+        }
+    }
+
     // ── Body generation ──────────────────────────────────────────────────────
 
     /// <summary>Generates a body for a Sub or property setter (no return value).</summary>
@@ -252,20 +334,26 @@ public sealed class CodeGenerator
                 {
                     if (dec.TypeRef != null) _procTypes[dec.Name] = dec.TypeRef.TypeName;
                     string typeStr = TypeStr(dec.TypeRef, dec.Name);
-                    string init    = dec.DefaultValue != null ? $" = {Expr(dec.DefaultValue)}" : "";
+                    string init    = dec.DefaultValue != null
+                        ? $" = {Expr(dec.DefaultValue)}"
+                        : $" = {DefaultInit(typeStr)}";
                     _w.WriteLine($"{(d.IsStatic ? "static " : "")}{typeStr} {dec.Name}{init};{ReviewComment(dec.TypeRef)}");
                 }
                 break;
 
             case ReDimNode r:
-                foreach (var dec in r.Declarators)
+                for (int _ri = 0; _ri < r.Declarators.Count; _ri++)
                 {
-                    string dims = dec.DefaultValue != null ? Expr(dec.DefaultValue) : "";
+                    var dec      = r.Declarators[_ri];
                     string baseType = dec.TypeRef != null
                         ? TypeStr(new TypeRefNode(dec.TypeRef.TypeName, false, false, 0), dec.Name)
                         : "object";
                     string preserve = r.IsPreserve ? " /* Preserve */" : "";
-                    // ReDim with dimensions stored in DefaultValue (as-is from parser)
+                    // Emit dimension expressions captured by the parser.
+                    var dimExprs = _ri < r.DimensionLists.Count ? r.DimensionLists[_ri] : null;
+                    string dims  = dimExprs != null && dimExprs.Count > 0
+                        ? string.Join(", ", dimExprs.Select(Expr))
+                        : "";
                     _w.WriteLine($"{dec.Name} = new {baseType}[{dims}]{preserve};");
                 }
                 break;
@@ -284,14 +372,25 @@ public sealed class CodeGenerator
 
             case CallStatementNode c:
                 string callTarget = Expr(c.Target);
+                // When ExplicitCall is true but the target is already a CallOrIndexNode (e.g.
+                // `Call Foo(x)` where the parser absorbed the parens into the node), don't add
+                // another "()" — that would produce double parentheses like `Foo(x)()`.
+                // If there are arguments, emit them.
+                // If the target is a CallOrIndexNode, its Expr() already includes "(...)" so
+                // don't add another pair. Otherwise always emit "()" — even when ExplicitCall
+                // is false (VB6 Sub calls without the Call keyword omit parens, but C# requires them).
                 string callArgs   = c.Arguments.Count > 0
-                    ? "(" + Args(c.Arguments) + ")"
-                    : c.ExplicitCall ? "()" : "";
+                    ? "(" + ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target)) + ")"
+                    : c.Target is not CallOrIndexNode ? "()" : "";
                 // Detect Err.Raise → throw
                 if (callTarget == "Err.Raise")
                 {
                     string desc = c.Arguments.Count >= 3 ? Expr(c.Arguments[2].Value!) : "\"\"";
                     _w.WriteLine($"throw new Exception({desc}); // Err.Raise");
+                }
+                else if (callTarget == "Err.Clear" || callTarget == "/* Err.Clear() */")
+                {
+                    _w.WriteLine("// Err.Clear(); // no direct C# equivalent — review error-handling logic");
                 }
                 else
                 {
@@ -300,7 +399,8 @@ public sealed class CodeGenerator
                 break;
 
             case IfNode i:
-                _w.WriteLine($"if ({Expr(i.Condition)})");
+                string ifComment = i.ThenComment != null ? $"  // {i.ThenComment.Text.TrimStart('\'').Trim()}" : "";
+                _w.WriteLine($"if ({Expr(i.Condition)}){ifComment}");
                 _w.OpenBrace();
                 foreach (var s in i.ThenBody) GenerateStatement(s, returnType, resultVar);
                 _w.CloseBrace();
@@ -573,12 +673,144 @@ public sealed class CodeGenerator
 
     private string MapCall(CallOrIndexNode c)
     {
-        // Bare identifier calls — check for built-in functions
+        // Bare identifier calls — type-aware overrides + built-in function mapping
         if (c.Target is IdentifierNode id)
         {
+            // IsMissing(x) — VB6 Optional parameter omission check.
+            // Maps to (x == null) for reference/object types; (x == default) for value types.
+            if (id.Name.Equals("IsMissing", StringComparison.OrdinalIgnoreCase) &&
+                c.Arguments.Count == 1 && !c.Arguments[0].IsMissing)
+            {
+                string argExpr = Expr(c.Arguments[0].Value!);
+                string? argType = TryGetSimpleType(c.Arguments[0].Value!);
+                string sentinel = (argType != null && NonNullableValueTypes.Contains(argType))
+                    ? "default" : "null";
+                return $"({argExpr} == {sentinel})";
+            }
+
+            // Type-aware Val() — choose the conversion based on the argument's known type.
+            if ((id.Name.Equals("Val", StringComparison.OrdinalIgnoreCase) ||
+                 id.Name.Equals("CDbl", StringComparison.OrdinalIgnoreCase)) &&
+                c.Arguments.Count == 1 && !c.Arguments[0].IsMissing)
+            {
+                var argNode = c.Arguments[0].Value!;
+                string argExpr = Expr(argNode);
+                string? argType = TryGetSimpleType(argNode);
+                string converted = IsNullableValueType(argType)
+                    ? $"Convert.ToDouble({argExpr}.GetValueOrDefault())"
+                    : $"Convert.ToDouble({argExpr})";
+                if (IsDefaultMemberCallArg(argNode))
+                    converted += " /* TODO: default-member object — may need .Value */";
+                return converted;
+            }
+
+            // Type-aware string-coercion functions (Trim, LTrim, RTrim, UCase, LCase, Len).
+            // For string args: method call directly (no .ToString() needed).
+            // For nullable value types: .GetValueOrDefault().ToString() first.
+            // For non-nullable value types / unknown: .ToString() (safe, compiles for all).
+            string? strFnSuffix = id.Name.ToLowerInvariant() switch
+            {
+                "trim"  or "trim$"  => ".Trim()",
+                "ltrim" or "ltrim$" => ".TrimStart()",
+                "rtrim" or "rtrim$" => ".TrimEnd()",
+                "ucase" or "ucase$" => ".ToUpper()",
+                "lcase" or "lcase$" => ".ToLower()",
+                "len"               => ".Length",
+                _ => null
+            };
+            if (strFnSuffix != null && c.Arguments.Count == 1 && !c.Arguments[0].IsMissing)
+            {
+                const string todoMarker = " /* TODO: default-member object — may need .Value */";
+                var argNode = c.Arguments[0].Value!;
+                string argExpr = Expr(argNode);
+                string? argType = TryGetSimpleType(argNode);
+
+                // If the inner expression already carries a TODO marker (e.g. from Val()),
+                // strip it before composing, then re-append at the outermost level.
+                bool hasTodo = argExpr.EndsWith(todoMarker);
+                if (hasTodo) argExpr = argExpr[..^todoMarker.Length];
+
+                string strExpr = argType == "string"
+                    ? argExpr
+                    : IsNullableValueType(argType)
+                        ? $"{argExpr}.GetValueOrDefault().ToString()"
+                        : $"{argExpr}.ToString()";
+                string result = $"{strExpr}{strFnSuffix}";
+                return hasTodo ? result + todoMarker : result;
+            }
+
+            // Type-aware string-position functions (Left, Right, Mid, InStr, InStrRev).
+            // If the first string argument is not a string type, wrap it with .ToString().
+            // This prevents compile errors when e.g. Left(intVar, 2) is called.
+            string lcFn = id.Name.ToLowerInvariant().TrimEnd('$');
+            if (lcFn is "left" or "right" or "mid" or "instr" or "instrrev" &&
+                c.Arguments.Count >= 2 && !c.Arguments[0].IsMissing)
+            {
+                switch (lcFn)
+                {
+                    case "left" when c.Arguments.Count >= 2:
+                    {
+                        string str = EnsureStringExpr(c.Arguments[0].Value!);
+                        string len = Expr(c.Arguments[1].Value!);
+                        return $"{str}.Substring(0, {len})";
+                    }
+                    case "right" when c.Arguments.Count >= 2:
+                    {
+                        string str = EnsureStringExpr(c.Arguments[0].Value!);
+                        string len = Expr(c.Arguments[1].Value!);
+                        return $"{str}.Substring({str}.Length - {len})";
+                    }
+                    case "mid" when c.Arguments.Count >= 2:
+                    {
+                        string str   = EnsureStringExpr(c.Arguments[0].Value!);
+                        string start = Expr(c.Arguments[1].Value!);
+                        return c.Arguments.Count >= 3 && !c.Arguments[2].IsMissing
+                            ? $"{str}.Substring({start} - 1, {Expr(c.Arguments[2].Value!)})"
+                            : $"{str}.Substring({start} - 1)";
+                    }
+                    case "instr" when c.Arguments.Count >= 2:
+                    {
+                        // 2-arg form: InStr(str, pattern); 3-arg: InStr(start, str, pattern)
+                        if (c.Arguments.Count >= 3 && !c.Arguments[2].IsMissing)
+                        {
+                            string str     = EnsureStringExpr(c.Arguments[1].Value!);
+                            string pattern = EnsureStringExpr(c.Arguments[2].Value!);
+                            return $"({str}.IndexOf({pattern}) + 1)";
+                        }
+                        else
+                        {
+                            string str     = EnsureStringExpr(c.Arguments[0].Value!);
+                            string pattern = EnsureStringExpr(c.Arguments[1].Value!);
+                            return $"({str}.IndexOf({pattern}) + 1)";
+                        }
+                    }
+                    case "instrrev" when c.Arguments.Count >= 2:
+                    {
+                        string str     = EnsureStringExpr(c.Arguments[0].Value!);
+                        string pattern = EnsureStringExpr(c.Arguments[1].Value!);
+                        return $"({str}.LastIndexOf({pattern}) + 1)";
+                    }
+                }
+            }
+
             string[] argArr = c.Arguments.Select(a => a.IsMissing ? "/* missing */" : Expr(a.Value!)).ToArray();
             if (BuiltInMap.TryGetFunction(id.Name, argArr, out var mapped))
+            {
+                // If a built-in that coerces to string/double receives an object returned from
+                // a default-member expansion, append a TODO: the caller may need .PropertyName.
+                // Strip any inner TODO from nested calls first, then re-append at the outermost level.
+                const string todoMarker = " /* TODO: default-member object — may need .Value */";
+                bool innerTodo = argArr.Length > 0 && argArr[0].EndsWith(todoMarker);
+                if (innerTodo)
+                {
+                    argArr[0] = argArr[0][..^todoMarker.Length];
+                    BuiltInMap.TryGetFunction(id.Name, argArr, out mapped);
+                    mapped += todoMarker;
+                }
+                else if (c.Arguments.Count > 0 && IsDefaultMemberCallArg(c.Arguments[0].Value))
+                    mapped += todoMarker;
                 return mapped;
+            }
         }
 
         // Member access calls — check for Debug.Print etc.
@@ -597,15 +829,37 @@ public sealed class CodeGenerator
                     "Number"      => "_ex.HResult /* Err.Number */",
                     "Description" => "_ex.Message",
                     "Source"      => "_ex.Source ?? \"\" /* Err.Source */",
-                    "Clear"       => "/* Err.Clear() */",
+                    "Clear"       => "/* Err.Clear() */",   // caught by CallStatementNode → commented out
                     _             => $"Err.{ma.MemberName} /* TODO */"
                 };
             }
         }
 
+        // Default member expansion: obj(arg) → obj.DefaultMember(arg)
+        // Applies when obj's declared type has a VB_UserMemId = 0 property.
+        if (c.Target is IdentifierNode idTarget && c.Arguments.Count > 0 && _defaultMemberMap != null)
+        {
+            string? varType = _procTypes.TryGetValue(idTarget.Name, out var t1) ? t1
+                            : _moduleFieldTypes.TryGetValue(idTarget.Name, out var t2) ? t2 : null;
+            if (varType != null && _defaultMemberMap.TryGetValue(varType, out var defMember))
+                return $"{idTarget.Name}.{defMember}({Args(c.Arguments)})";
+        }
+
+        // COM indexed-member check: obj.Member(i) → obj.Member[i]
+        // Applies when the receiver's declared type and member name are in ComTypeMap
+        // (e.g. ADODB.Recordset.Fields, DAO.Recordset.Fields, …).
+        if (c.Target is MemberAccessNode comMa && c.Arguments.Count > 0)
+        {
+            string? receiverType = TryGetSimpleType(comMa.Object);
+            if (receiverType != null && ComTypeMap.IsIndexedMember(receiverType, comMa.MemberName))
+                return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+        }
+
         // General call
         string target = Expr(c.Target);
-        string args   = c.Arguments.Count > 0 ? $"({Args(c.Arguments)})" : "()";
+        string args   = c.Arguments.Count > 0
+            ? $"({ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target))})"
+            : "()";
         return $"{target}{args}";
     }
 
@@ -629,6 +883,14 @@ public sealed class CodeGenerator
         TokenKind.LessEqual, TokenKind.GreaterEqual,
     ];
 
+    // C# value type names produced by the Transformer's type mapping.
+    private static readonly HashSet<string> NonNullableValueTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "int", "long", "double", "float", "bool", "byte", "short", "DateTime", "decimal" };
+
+    private static bool IsNullableValueType(string? csType) =>
+        csType != null && csType.EndsWith('?') &&
+        NonNullableValueTypes.Contains(csType[..^1]);
+
     /// <summary>
     /// Returns true when the expression is a bare identifier that resolves to
     /// an enum member in the cross-module enum map.
@@ -637,6 +899,23 @@ public sealed class CodeGenerator
         _enumMemberMap != null &&
         e is IdentifierNode id &&
         _enumMemberMap.ContainsKey(id.Name);
+
+    /// <summary>
+    /// Returns true when an expression argument is a CallOrIndexNode whose target is
+    /// a variable with a declared type that has a default member.  Used to emit a
+    /// TODO annotation when a built-in coercion function (Val, Trim, …) receives an
+    /// object returned from a default-member expansion, since .ToString() on that
+    /// object may not yield the expected value.
+    /// </summary>
+    private bool IsDefaultMemberCallArg(ExpressionNode? e)
+    {
+        if (e is not CallOrIndexNode c) return false;
+        if (c.Target is not IdentifierNode idTarget) return false;
+        if (_defaultMemberMap == null) return false;
+        string? varType = _procTypes.TryGetValue(idTarget.Name, out var t1) ? t1
+                        : _moduleFieldTypes.TryGetValue(idTarget.Name, out var t2) ? t2 : null;
+        return varType != null && _defaultMemberMap.ContainsKey(varType);
+    }
 
     // ── Scope helpers ─────────────────────────────────────────────────────────
 
@@ -647,6 +926,119 @@ public sealed class CodeGenerator
         foreach (var p in parameters)
             if (p.TypeRef != null)
                 _procTypes[p.Name] = p.TypeRef.TypeName;
+    }
+
+    /// <summary>
+    /// Attempts to infer a more specific return type for a function declared as
+    /// <c>object</c> (was <c>Variant</c> in VB6) by examining what is actually
+    /// returned via <see cref="FunctionReturnNode"/> assignments in the body.
+    ///
+    /// Works by pre-building a full locals map (parameters + all <c>Dim</c>
+    /// declarations in all scopes), then calling <see cref="TypeStr"/> on the
+    /// TypeRef of each returned identifier.  Returns the declared type unchanged
+    /// when inference is ambiguous or yields no result.
+    /// </summary>
+    private string InferActualReturnType(
+        IReadOnlyList<ParameterNode> parameters,
+        IReadOnlyList<AstNode> body,
+        string declaredReturnType)
+    {
+        if (!declaredReturnType.Equals("object", StringComparison.OrdinalIgnoreCase))
+            return declaredReturnType;
+
+        // Build a full type-ref map: parameters + all locals in the body.
+        var typeRefs = new Dictionary<string, TypeRefNode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in parameters)
+            if (p.TypeRef != null) typeRefs[p.Name] = p.TypeRef;
+        CollectBodyTypeRefs(body, typeRefs);
+
+        // Collect all FunctionReturnNode values throughout the body.
+        var returnValues = new List<ExpressionNode>();
+        CollectReturnValues(body, returnValues);
+        if (returnValues.Count == 0) return declaredReturnType;
+
+        // Evaluate each returned expression — only identifier nodes are resolvable here.
+        string? inferred = null;
+        foreach (var rv in returnValues)
+        {
+            if (rv is not IdentifierNode rvId) return declaredReturnType; // complex expression
+            if (!typeRefs.TryGetValue(rvId.Name, out var typeRef)) return declaredReturnType;
+            string csType = TypeStr(typeRef, rvId.Name);
+            if (csType == "object") return declaredReturnType; // still unresolved
+            if (inferred == null)
+                inferred = csType;
+            else if (!inferred.Equals(csType, StringComparison.Ordinal))
+                return declaredReturnType; // conflicting types
+        }
+        return inferred ?? declaredReturnType;
+    }
+
+    /// <summary>
+    /// Recursively collects TypeRef nodes for all local variable declarations
+    /// in every nested scope of <paramref name="body"/>.
+    /// </summary>
+    private static void CollectBodyTypeRefs(
+        IReadOnlyList<AstNode> body,
+        Dictionary<string, TypeRefNode> result)
+    {
+        foreach (var node in body)
+        {
+            if (node is LocalDimNode dim)
+                foreach (var d in dim.Declarators)
+                    if (d.TypeRef != null) result[d.Name] = d.TypeRef;
+
+            // Recurse into every statement that has a child body.
+            IEnumerable<IReadOnlyList<AstNode>> children = node switch
+            {
+                IfNode i         => i.ElseBody != null
+                                    ? i.ElseIfClauses.Select(e => e.Body)
+                                        .Append(i.ThenBody).Append(i.ElseBody)
+                                    : i.ElseIfClauses.Select(e => e.Body).Append(i.ThenBody),
+                SelectCaseNode s => s.Cases.Select(c => c.Body),
+                ForNextNode f    => [f.Body],
+                ForEachNode f    => [f.Body],
+                WhileNode w      => [w.Body],
+                DoLoopNode d     => [d.Body],
+                WithNode w       => [w.Body],
+                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                _                => []
+            };
+            foreach (var child in children)
+                CollectBodyTypeRefs(child, result);
+        }
+    }
+
+    /// <summary>
+    /// Recursively collects the value-expression of every
+    /// <see cref="FunctionReturnNode"/> in all nested scopes of <paramref name="body"/>.
+    /// </summary>
+    private static void CollectReturnValues(
+        IReadOnlyList<AstNode> body,
+        List<ExpressionNode> result)
+    {
+        foreach (var node in body)
+        {
+            if (node is FunctionReturnNode ret)
+                result.Add(ret.Value);
+
+            IEnumerable<IReadOnlyList<AstNode>> children = node switch
+            {
+                IfNode i         => i.ElseBody != null
+                                    ? i.ElseIfClauses.Select(e => e.Body)
+                                        .Append(i.ThenBody).Append(i.ElseBody)
+                                    : i.ElseIfClauses.Select(e => e.Body).Append(i.ThenBody),
+                SelectCaseNode s => s.Cases.Select(c => c.Body),
+                ForNextNode f    => [f.Body],
+                ForEachNode f    => [f.Body],
+                WhileNode w      => [w.Body],
+                DoLoopNode d     => [d.Body],
+                WithNode w       => [w.Body],
+                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                _                => []
+            };
+            foreach (var child in children)
+                CollectReturnValues(child, result);
+        }
     }
 
     /// <summary>
@@ -668,6 +1060,35 @@ public sealed class CodeGenerator
 
     private static bool IsNumericCsType(string? type) =>
         type is "int" or "long" or "double" or "float" or "decimal" or "byte";
+
+    /// <summary>
+    /// Returns a C# expression for <paramref name="node"/> guaranteed to be a string.
+    /// String types are returned as-is; nullable value types get .GetValueOrDefault().ToString();
+    /// everything else gets .ToString().
+    /// </summary>
+    private string EnsureStringExpr(ExpressionNode node)
+    {
+        string expr  = Expr(node);
+        string? type = TryGetSimpleType(node);
+        if (type == "string") return expr;
+        if (IsNullableValueType(type)) return $"{expr}.GetValueOrDefault().ToString()";
+        return $"{expr}.ToString()";
+    }
+
+    // VB6 date/time system identifiers (no arguments) that resolve to DateTime values.
+    private static readonly HashSet<string> Vb6DateTimeNames =
+        new(StringComparer.OrdinalIgnoreCase) { "Date", "Now", "Time" };
+
+    /// <summary>
+    /// Returns true when the expression is a VB6 date/time system identifier (Date, Now, Time)
+    /// or a variable/field whose declared type is DateTime.
+    /// </summary>
+    private bool IsDateTimeExpression(ExpressionNode e)
+    {
+        if (e is IdentifierNode id && Vb6DateTimeNames.Contains(id.Name))
+            return true;
+        return TryGetSimpleType(e) == "DateTime";
+    }
 
     /// <summary>
     /// Converts a numeric expression string to its string equivalent for use in
@@ -728,6 +1149,21 @@ public sealed class CodeGenerator
                 right = NumericToString(b.Right, right);
             else if (rightType == "string" && IsNumericCsType(leftType))
                 left  = NumericToString(b.Left, left);
+        }
+
+        // VB6 date arithmetic: Date ± n means add/subtract days.
+        // In C#, DateTime does not support + / - with a bare integer; use .AddDays().
+        if ((b.Operator == TokenKind.Plus || b.Operator == TokenKind.Minus) &&
+            IsDateTimeExpression(b.Left) &&
+            (IsNumericCsType(TryGetSimpleType(b.Right)) ||
+             b.Right is IntegerLiteralNode || b.Right is DoubleLiteralNode))
+        {
+            string daysArg = b.Operator == TokenKind.Minus
+                ? (b.Right is IntegerLiteralNode il ? $"-{il.Value}"
+                   : b.Right is DoubleLiteralNode  dl ? $"-{dl.RawText}"
+                   : $"-({right})")
+                : right;
+            return $"{left}.AddDays({daysArg})";
         }
 
         string op = b.Operator switch
@@ -800,6 +1236,75 @@ public sealed class CodeGenerator
             a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" :
             Expr(a.Value!)));
 
+    /// <summary>
+    /// Like Args(), but prepends `ref ` to positional arguments whose corresponding
+    /// parameter is declared ByRef, using the supplied mode list.
+    /// </summary>
+    private string ArgsWithRef(IReadOnlyList<ArgumentNode> args,
+        IReadOnlyList<Parsing.Nodes.ParameterMode>? modes)
+    {
+        if (modes == null) return Args(args);
+        var parts = new List<string>(args.Count);
+        for (int i = 0; i < args.Count; i++)
+        {
+            var a = args[i];
+            if (a.IsMissing) { parts.Add("/* missing */"); continue; }
+            string expr = a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" : Expr(a.Value!);
+            bool isByRef = i < modes.Count && modes[i] == Parsing.Nodes.ParameterMode.ByRef;
+            parts.Add(isByRef ? $"ref {expr}" : expr);
+        }
+        return string.Join(", ", parts);
+    }
+
+    /// <summary>
+    /// Tries to resolve the parameter mode list for a call target by looking up the
+    /// method name and (optionally) the qualifying module name in _methodParamMap.
+    /// Returns null when the target cannot be resolved or the map is absent.
+    /// </summary>
+    private IReadOnlyList<Parsing.Nodes.ParameterMode>? TryResolveProcParamModes(ExpressionNode target)
+    {
+        if (_methodParamMap == null) return null;
+
+        // Simple call: Foo(...)
+        if (target is IdentifierNode id)
+        {
+            // Check current module first, then all modules (for same-module calls without qualifier).
+            if (_methodParamMap.TryGetValue(_currentModuleName, out var selfMethods) &&
+                selfMethods.TryGetValue(id.Name, out var modes0))
+                return modes0;
+            foreach (var module in _methodParamMap.Values)
+                if (module.TryGetValue(id.Name, out var modes1))
+                    return modes1;
+            return null;
+        }
+
+        // Qualified call: Obj.Method(...) or ModuleName.Method(...)
+        if (target is MemberAccessNode ma)
+        {
+            // Direct lookup by qualifier string (works when qualifier is the class/module name itself).
+            string qualifier = ma.Object is IdentifierNode qid ? qid.Name : Expr(ma.Object);
+            if (_methodParamMap.TryGetValue(qualifier, out var methods1) &&
+                methods1.TryGetValue(ma.MemberName, out var modes2))
+                return modes2;
+
+            // The qualifier is likely a variable name (e.g. `M46V999` of type `clsM46V999`).
+            // Look up its declared type (local, module field, or global) and retry.
+            if (ma.Object is IdentifierNode varId)
+            {
+                string? varType = _procTypes.TryGetValue(varId.Name, out var t1) ? t1
+                                : _moduleFieldTypes.TryGetValue(varId.Name, out var t2) ? t2
+                                : (_globalVarMap != null && _globalVarMap.TryGetValue(varId.Name, out var t3)) ? t3
+                                : null;
+                if (varType != null &&
+                    _methodParamMap.TryGetValue(varType, out var methods2) &&
+                    methods2.TryGetValue(ma.MemberName, out var modes3))
+                    return modes3;
+            }
+        }
+
+        return null;
+    }
+
     private string TypeStr(TypeRefNode? t, string context)
     {
         if (t == null) return "object";
@@ -825,6 +1330,14 @@ public sealed class CodeGenerator
         t?.TypeName == "Collection<object>"
             ? " // REVIEW: Collection<object> — replace with List<T> or Dictionary<string, T> once element type is known"
             : null;
+
+    /// <summary>
+    /// Returns the appropriate default initializer expression for a declared local.
+    /// String → "" (VB6 strings default to empty, not null).
+    /// Everything else → default (0 for value types, null for reference types).
+    /// </summary>
+    private static string DefaultInit(string typeName) =>
+        typeName == "string" ? "\"\"" : "default";
 
     private static string Access(AccessModifier a) => a switch
     {

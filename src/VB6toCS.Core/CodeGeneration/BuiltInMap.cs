@@ -83,7 +83,7 @@ internal static class BuiltInMap
 
             // Date/Time
             ["Now"]       = _ => "DateTime.Now",
-            ["Date"]      = _ => "DateTime.Today",
+            ["Date"]      = _ => "DateTime.Now.Date",
             ["Time"]      = _ => "DateTime.Now.TimeOfDay",
             ["Timer"]     = _ => "DateTime.Now.TimeOfDay.TotalSeconds",
             ["DateAdd"]   = a => $"/* DateAdd */ {RawArgs(a)} /* TODO: use DateTime.Add */",
@@ -141,6 +141,11 @@ internal static class BuiltInMap
             ["Nothing"]         = "null",
             ["Empty"]           = "null",
             ["Null"]            = "null",
+            // VB6 date/time built-ins used as bare identifiers (no parentheses)
+            ["Now"]             = "DateTime.Now",
+            ["Date"]            = "DateTime.Now.Date",
+            ["Time"]            = "DateTime.Now.TimeOfDay",
+            ["Timer"]           = "DateTime.Now.TimeOfDay.TotalSeconds",
         };
 
     public static bool TryGetFunction(string name, string[] args, out string result)

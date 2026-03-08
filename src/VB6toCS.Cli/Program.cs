@@ -161,6 +161,15 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
+    // ── Cross-module default member map (used by code generator to expand default member calls) ─
+    var defaultMemberMap = BuildDefaultMemberMap(stage3List.Select(r => r.Module));
+
+    // ── Cross-module method parameter map (used by code generator to emit ref at call sites) ───
+    var methodParamMap = BuildMethodParamMap(stage3List.Select(r => r.Module));
+
+    // ── Cross-module global variable map (public fields from all modules → declared type) ──────
+    var globalVarMap = BuildGlobalVarMap(stage3List.Select(r => r.Module));
+
     // ── Cross-module Collection type inference (between stages 3 and 4) ───────
     IReadOnlyDictionary<(string, string), string> collectionTypeMap;
     {
@@ -209,7 +218,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -337,6 +346,91 @@ static int PrintError(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
     return 1;
+}
+
+/// <summary>
+/// Builds a cross-module method parameter map from all Stage-3 ASTs.
+/// Maps each module/class name → method name → ordered list of ParameterMode values.
+/// Used by the code generator to emit 'ref' at call sites where the callee declares ByRef.
+/// </summary>
+static IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<ParameterMode>>>
+    BuildMethodParamMap(IEnumerable<ModuleNode> modules)
+{
+    var outer = new Dictionary<string, IReadOnlyDictionary<string, IReadOnlyList<ParameterMode>>>(
+        StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        var inner = new Dictionary<string, IReadOnlyList<ParameterMode>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case SubNode s:
+                    inner[s.Name] = s.Parameters.Select(p => p.Mode).ToArray();
+                    break;
+                case FunctionNode f:
+                    inner[f.Name] = f.Parameters.Select(p => p.Mode).ToArray();
+                    break;
+                // Parameterized Property Get is emitted as a method — include its params too.
+                case CsPropertyNode p when p.GetParameters.Count > 0:
+                    inner[p.Name] = p.GetParameters.Select(pr => pr.Mode).ToArray();
+                    break;
+            }
+        }
+        outer[module.Name] = inner;
+    }
+    return outer;
+}
+
+/// <summary>
+/// Builds a cross-module global variable map from all Stage-3 ASTs.
+/// Maps every Public field name (from any module) to its declared VB6 type name.
+/// Used to resolve qualified calls like `M46V999.Method()` where M46V999 is a public
+/// field declared in another module and not visible in the local/module scope.
+/// When the same name is declared in multiple modules with different types, it is excluded
+/// (ambiguous — the caller must rely on the local scope lookup instead).
+/// </summary>
+static IReadOnlyDictionary<string, string> BuildGlobalVarMap(IEnumerable<ModuleNode> modules)
+{
+    var map       = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            if (member is not FieldNode f) continue;
+            if (f.Access != AccessModifier.Public && f.Access != AccessModifier.Global) continue;
+            foreach (var d in f.Declarators)
+            {
+                if (d.TypeRef == null) continue;
+                if (!map.TryAdd(d.Name, d.TypeRef.TypeName))
+                {
+                    if (!map[d.Name].Equals(d.TypeRef.TypeName, StringComparison.OrdinalIgnoreCase))
+                        conflicts.Add(d.Name);
+                }
+            }
+        }
+    }
+
+    foreach (var name in conflicts)
+        map.Remove(name);
+
+    return map;
+}
+
+/// <summary>
+/// Builds a cross-module default member map from all Stage-3 ASTs.
+/// Maps each module name to the name of its default member (VB_UserMemId = 0).
+/// </summary>
+static IReadOnlyDictionary<string, string> BuildDefaultMemberMap(IEnumerable<ModuleNode> modules)
+{
+    var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var module in modules)
+        if (module.DefaultMemberName != null)
+            map[module.Name] = module.DefaultMemberName;
+    return map;
 }
 
 /// <summary>

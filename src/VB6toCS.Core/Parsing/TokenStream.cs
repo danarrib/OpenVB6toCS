@@ -84,6 +84,17 @@ public sealed class TokenStream
                || (SingleLineIfMode && k == TokenKind.KwElse);
     }
 
+    /// <summary>
+    /// If the current token is a comment, consume and return it as a <see cref="Nodes.CommentNode"/>.
+    /// Returns null if there is no trailing comment.
+    /// </summary>
+    public Nodes.CommentNode? ConsumeTrailingComment()
+    {
+        if (Peek().Kind != TokenKind.Comment) return null;
+        var t = Consume();
+        return new Nodes.CommentNode(t.Line, t.Column, t.Text);
+    }
+
     /// <summary>Consume trailing comments then one end-of-statement token or throw.</summary>
     public void ExpectEndOfStatement()
     {

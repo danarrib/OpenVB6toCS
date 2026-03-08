@@ -13,7 +13,16 @@ public sealed record ReDimNode(
     int Line,
     int Column,
     bool IsPreserve,
-    IReadOnlyList<VariableDeclaratorNode> Declarators) : AstNode(Line, Column);
+    IReadOnlyList<VariableDeclaratorNode> Declarators) : AstNode(Line, Column)
+{
+    /// <summary>
+    /// Dimension expressions per declarator (same order and count as <see cref="Declarators"/>).
+    /// Each inner list contains the upper-bound expressions for that array variable.
+    /// Empty outer list means no dimension information was available (legacy / fallback).
+    /// </summary>
+    public IReadOnlyList<IReadOnlyList<ExpressionNode>> DimensionLists { get; init; } =
+        Array.Empty<IReadOnlyList<ExpressionNode>>();
+}
 
 /// <summary>VB6 'Error errornumber' statement — raises a runtime error.</summary>
 public sealed record ErrorStatementNode(
@@ -53,7 +62,8 @@ public sealed record IfNode(
     ExpressionNode Condition,
     IReadOnlyList<AstNode> ThenBody,
     IReadOnlyList<ElseIfClauseNode> ElseIfClauses,
-    IReadOnlyList<AstNode>? ElseBody) : AstNode(Line, Column);
+    IReadOnlyList<AstNode>? ElseBody,
+    CommentNode? ThenComment = null) : AstNode(Line, Column);
 
 public sealed record ElseIfClauseNode(
     int Line,

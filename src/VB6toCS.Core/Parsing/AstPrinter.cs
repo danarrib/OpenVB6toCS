@@ -9,7 +9,8 @@ public static class AstPrinter
 {
     public static void Print(ModuleNode module, TextWriter writer)
     {
-        writer.WriteLine($"ModuleNode '{module.Name}' [{module.Kind}]");
+        string defMember = module.DefaultMemberName != null ? $" [Default: {module.DefaultMemberName}]" : "";
+        writer.WriteLine($"ModuleNode '{module.Name}' [{module.Kind}]{defMember}");
         foreach (var impl in module.Implements)
             writer.WriteLine($"  Implements {impl}");
         PrintNodes(module.Members, writer, "  ");

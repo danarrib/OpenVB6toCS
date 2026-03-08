@@ -122,29 +122,35 @@ public sealed class CollectionTypeInferrer
         IReadOnlyList<AstNode> body)
     {
         var locals = BuildLocals(parameters, body);
-        ScanBodyForAdds(body, moduleName, locals, new Stack<string?>());
+        // Pre-pass: infer element types for local Collection variables within this procedure
+        // (e.g. "Dim lCampos As Collection" where lCampos.Add lCampo (clsYasField) is called).
+        // This lets us emit "Collection<clsYasField>" rather than bare "Collection" when lCampos
+        // is subsequently added to a module-level Collection field.
+        var localCollElemTypes = BuildLocalCollElemTypes(body, moduleName, locals);
+        ScanBodyForAdds(body, moduleName, locals, localCollElemTypes, new Stack<string?>());
     }
 
     private void ScanBodyForAdds(
         IReadOnlyList<AstNode> body,
         string moduleName,
         Dictionary<string, string> locals,
+        IReadOnlyDictionary<string, string> localCollElemTypes,
         Stack<string?> withStack)
     {
         foreach (var node in body)
         {
-            RecordAddCall(node, moduleName, locals, withStack);
+            RecordAddCall(node, moduleName, locals, localCollElemTypes, withStack);
 
             if (node is WithNode w)
             {
                 withStack.Push(InferMemberType(w.Object, moduleName, locals));
-                ScanBodyForAdds(w.Body, moduleName, locals, withStack);
+                ScanBodyForAdds(w.Body, moduleName, locals, localCollElemTypes, withStack);
                 withStack.Pop();
             }
             else
             {
                 foreach (var child in ChildBodies(node))
-                    ScanBodyForAdds(child, moduleName, locals, withStack);
+                    ScanBodyForAdds(child, moduleName, locals, localCollElemTypes, withStack);
             }
         }
     }
@@ -153,6 +159,7 @@ public sealed class CollectionTypeInferrer
         AstNode node,
         string moduleName,
         Dictionary<string, string> locals,
+        IReadOnlyDictionary<string, string> localCollElemTypes,
         Stack<string?> withStack)
     {
         if (node is not CallStatementNode call) return;
@@ -183,6 +190,18 @@ public sealed class CollectionTypeInferrer
         string? elemType = InferMemberType(itemArg.Value, moduleName, locals);
         if (elemType == null) return;
 
+        // If the item being added is itself a local Collection variable whose element type
+        // we pre-resolved (e.g. lCampos whose items are clsYasField), upgrade the element
+        // type from bare "Collection" to the parameterised "Collection<innerElem>" so that
+        // the outer field is typed Collection<Collection<innerElem>> rather than
+        // Collection<Collection>.
+        if (elemType.Equals("Collection", StringComparison.OrdinalIgnoreCase) &&
+            itemArg.Value is IdentifierNode itemId &&
+            localCollElemTypes.TryGetValue(itemId.Name, out var innerElem))
+        {
+            elemType = $"Collection<{innerElem}>";
+        }
+
         var target = ResolveCollectionTarget(addMa.Object, moduleName, locals, withStack);
         if (target == null) return;
 
@@ -190,6 +209,85 @@ public sealed class CollectionTypeInferrer
         if (!_hits.TryGetValue(key, out var set))
             _hits[key] = set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         set.Add(elemType);
+    }
+
+    // ── Local Collection element-type pre-pass ────────────────────────────────
+
+    /// <summary>
+    /// Scans a procedure body to infer element types for local Collection variables.
+    /// For each <c>Dim x As Collection</c> where only one distinct item type is ever
+    /// added to <c>x</c>, records <c>x → elemType</c>.  Conflicting types are excluded.
+    /// </summary>
+    private Dictionary<string, string> BuildLocalCollElemTypes(
+        IReadOnlyList<AstNode> body,
+        string moduleName,
+        Dictionary<string, string> locals)
+    {
+        var result    = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var localColls = locals
+            .Where(kv => kv.Value.Equals("Collection", StringComparison.OrdinalIgnoreCase))
+            .Select(kv => kv.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (localColls.Count == 0) return result;
+
+        ScanBodyForLocalCollAdds(body, moduleName, locals, localColls, result, conflicts);
+        return result;
+    }
+
+    private void ScanBodyForLocalCollAdds(
+        IReadOnlyList<AstNode> body,
+        string moduleName,
+        Dictionary<string, string> locals,
+        HashSet<string> localColls,
+        Dictionary<string, string> result,
+        HashSet<string> conflicts)
+    {
+        foreach (var node in body)
+        {
+            if (node is CallStatementNode call)
+            {
+                MemberAccessNode? addMa = null;
+                IReadOnlyList<ArgumentNode> addArgs = [];
+
+                if (call.Target is MemberAccessNode ma1 &&
+                    ma1.MemberName.Equals("Add", StringComparison.OrdinalIgnoreCase))
+                { addMa = ma1; addArgs = call.Arguments; }
+                else if (call.Target is CallOrIndexNode coi &&
+                         coi.Target is MemberAccessNode ma2 &&
+                         ma2.MemberName.Equals("Add", StringComparison.OrdinalIgnoreCase))
+                { addMa = ma2; addArgs = coi.Arguments; }
+
+                if (addMa?.Object is IdentifierNode collId &&
+                    localColls.Contains(collId.Name) &&
+                    !conflicts.Contains(collId.Name))
+                {
+                    var itemArg = addArgs.FirstOrDefault(a => !a.IsMissing);
+                    if (itemArg?.Value != null)
+                    {
+                        string? elemType = InferMemberType(itemArg.Value, moduleName, locals);
+                        if (elemType != null)
+                        {
+                            if (!result.TryGetValue(collId.Name, out var existing))
+                                result[collId.Name] = elemType;
+                            else if (!existing.Equals(elemType, StringComparison.OrdinalIgnoreCase))
+                            {
+                                result.Remove(collId.Name);
+                                conflicts.Add(collId.Name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (node is WithNode w)
+                ScanBodyForLocalCollAdds(w.Body, moduleName, locals, localColls, result, conflicts);
+            else
+                foreach (var child in ChildBodies(node))
+                    ScanBodyForLocalCollAdds(child, moduleName, locals, localColls, result, conflicts);
+        }
     }
 
     // ── Propagation (Pass 4+) ─────────────────────────────────────────────────

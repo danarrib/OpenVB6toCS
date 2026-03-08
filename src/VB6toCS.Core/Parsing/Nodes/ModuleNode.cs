@@ -6,4 +6,5 @@ public sealed record ModuleNode(
     ModuleKind Kind,
     string Name,
     IReadOnlyList<string> Implements,
-    IReadOnlyList<AstNode> Members) : AstNode(Line, Column);
+    IReadOnlyList<AstNode> Members,
+    string? DefaultMemberName = null) : AstNode(Line, Column);

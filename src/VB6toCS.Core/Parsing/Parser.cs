@@ -11,6 +11,7 @@ public sealed class Parser
 {
     private readonly TokenStream _ts;
     private readonly string _filePath;
+    private string? _defaultMemberName;
 
     public Parser(IReadOnlyList<Token> tokens, string filePath)
     {
@@ -27,7 +28,7 @@ public sealed class Parser
         SkipClassHeader();
         string name = ParseModuleName();
         var (implements, members) = ParseModuleMembers();
-        return new ModuleNode(1, 1, kind, name, implements, members);
+        return new ModuleNode(1, 1, kind, name, implements, members, _defaultMemberName);
     }
 
     // ── Module kind detection ───────────────────────────────────────────────
@@ -734,6 +735,18 @@ public sealed class Parser
 
     private AstNode? ParseAttributeLine()
     {
+        // Detect:  Attribute PropertyName.VB_UserMemId = 0
+        // Tokens:  KwAttribute  Identifier  Dot  Identifier("VB_UserMemId")  Equals  IntegerLiteral("0")
+        if (_ts.PeekAt(1).Kind == TokenKind.Identifier &&
+            _ts.PeekAt(2).Kind == TokenKind.Dot &&
+            _ts.PeekAt(3).Kind == TokenKind.Identifier &&
+            _ts.PeekAt(3).Text.Equals("VB_UserMemId", StringComparison.OrdinalIgnoreCase) &&
+            _ts.PeekAt(4).Kind == TokenKind.Equals &&
+            _ts.PeekAt(5).Kind == TokenKind.IntegerLiteral &&
+            _ts.PeekAt(5).Text == "0")
+        {
+            _defaultMemberName = _ts.PeekAt(1).Text;
+        }
         _ts.SkipToEndOfLine();
         return null;
     }
@@ -770,13 +783,75 @@ public sealed class Parser
                           _ts.Peek().Text.Equals("Preserve", StringComparison.OrdinalIgnoreCase);
         if (isPreserve) _ts.Consume();
 
-        var declarators = new List<VariableDeclaratorNode>();
-        declarators.Add(ParseVariableDeclarator());
+        var declarators  = new List<VariableDeclaratorNode>();
+        var dimLists     = new List<IReadOnlyList<ExpressionNode>>();
+
+        var (dec, dims) = ParseReDimDeclarator();
+        declarators.Add(dec); dimLists.Add(dims);
         while (_ts.Match(TokenKind.Comma))
-            declarators.Add(ParseVariableDeclarator());
+        {
+            (dec, dims) = ParseReDimDeclarator();
+            declarators.Add(dec); dimLists.Add(dims);
+        }
 
         _ts.ExpectEndOfStatement();
-        return new ReDimNode(start.Line, start.Column, isPreserve, declarators);
+        return new ReDimNode(start.Line, start.Column, isPreserve, declarators)
+        {
+            DimensionLists = dimLists
+        };
+    }
+
+    /// <summary>
+    /// Parses one ReDim declarator: <c>Name(dim1, dim2, ...) [As Type]</c>.
+    /// Returns the declarator node and its dimension-expression list separately,
+    /// since <see cref="VariableDeclaratorNode.DefaultValue"/> is reserved for
+    /// constant initializers in ordinary Dim/Const declarations.
+    /// </summary>
+    private (VariableDeclaratorNode dec, IReadOnlyList<ExpressionNode> dims) ParseReDimDeclarator()
+    {
+        var nameTok = ExpectIdentifierOrKeyword();
+        var dims    = new List<ExpressionNode>();
+
+        if (_ts.Match(TokenKind.LParen))
+        {
+            if (_ts.Peek().Kind != TokenKind.RParen)
+            {
+                dims.Add(ParseReDimDimension());
+                while (_ts.Match(TokenKind.Comma))
+                    dims.Add(ParseReDimDimension());
+            }
+            _ts.Expect(TokenKind.RParen);
+        }
+
+        TypeRefNode? typeRef = null;
+        if (_ts.Match(TokenKind.KwAs))
+        {
+            typeRef = ParseTypeRef();
+            if (dims.Count > 0 && typeRef != null && !typeRef.IsArray)
+                typeRef = typeRef with { IsArray = true, ArrayRank = Math.Max(1, dims.Count) };
+        }
+        else if (dims.Count > 0)
+        {
+            typeRef = new TypeRefNode("Variant", true, false, Math.Max(1, dims.Count));
+        }
+
+        return (new VariableDeclaratorNode(nameTok.Line, nameTok.Column, nameTok.Text, typeRef, null), dims);
+    }
+
+    /// <summary>
+    /// Parses one dimension entry in a ReDim statement.
+    /// VB6 allows either a bare upper-bound <c>n</c> or an explicit range <c>lowerBound To upperBound</c>.
+    /// C# arrays are always 0-based, so we drop the lower bound and keep only the upper-bound expression.
+    /// </summary>
+    private ExpressionNode ParseReDimDimension()
+    {
+        var expr = ParseExpression();
+        if (_ts.Peek().Kind == TokenKind.KwTo)
+        {
+            _ts.Consume(); // consume "To"
+            expr = ParseExpression(); // upper bound replaces lower bound
+        }
+        return expr;
     }
 
     // VB6 file I/O statements — out of scope; skip the line and emit a comment placeholder.
@@ -985,6 +1060,7 @@ public sealed class Parser
             }
         }
 
+        var thenComment = _ts.ConsumeTrailingComment();
         _ts.ExpectEndOfStatement();
 
         // Block If
@@ -1026,7 +1102,7 @@ public sealed class Parser
         _ts.Expect(TokenKind.KwIf);
         _ts.ExpectEndOfStatement();
 
-        return new IfNode(start.Line, start.Column, condition, thenBody, elseIfClauses, elseBody);
+        return new IfNode(start.Line, start.Column, condition, thenBody, elseIfClauses, elseBody, thenComment);
     }
 
     // ── Select Case ────────────────────────────────────────────────────────
