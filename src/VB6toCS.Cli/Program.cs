@@ -210,6 +210,11 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
+    // ── Cross-module member type map: fieldName → C# type (all fields + UDT fields) ──
+    // Built from Stage-4 modules. Used to resolve member-access types like obj.Val_IS
+    // when the receiver's declared type is unknown (cross-module UDT fields).
+    var allMemberTypeMap = BuildAllMemberTypeMap(parsed.Select(p => p.Module));
+
     // ── Set of field names (module fields + UDT fields) whose type is Dictionary<…> ─
     // Built from Stage-4 modules so types are already normalised by the Transformer.
     // Used by the code generator to append .Values when iterating over a Dictionary
@@ -226,7 +231,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -536,6 +541,53 @@ static IReadOnlySet<string> BuildDictionaryTypedFieldNames(IEnumerable<ModuleNod
 
 static bool IsDictionaryType(string? typeName) =>
     typeName != null && typeName.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase);
+
+/// <summary>
+/// Builds a cross-module map of member name → C# type for ALL fields, properties,
+/// and UDT fields across every module (built from Stage-4 normalised types).
+/// Names that appear with conflicting types in different declarations are excluded
+/// to avoid false positives. Used by the code generator to resolve the type of
+/// member-access expressions like <c>obj.Val_IS</c> when <c>obj</c>'s type is unknown.
+/// </summary>
+static IReadOnlyDictionary<string, string> BuildAllMemberTypeMap(IEnumerable<ModuleNode> modules)
+{
+    var map       = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    void Add(string name, string? typeName)
+    {
+        if (string.IsNullOrEmpty(typeName) || conflicts.Contains(name)) return;
+        if (!map.TryAdd(name, typeName) &&
+            !map[name].Equals(typeName, StringComparison.OrdinalIgnoreCase))
+        {
+            conflicts.Add(name);
+            map.Remove(name);
+        }
+    }
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case FieldNode f:
+                    foreach (var d in f.Declarators)
+                        Add(d.Name, d.TypeRef?.TypeName);
+                    break;
+                case CsPropertyNode p:
+                    Add(p.Name, p.Type?.TypeName);
+                    break;
+                case UdtNode u:
+                    foreach (var fld in u.Fields)
+                        Add(fld.Name, fld.TypeRef.TypeName);
+                    break;
+            }
+        }
+    }
+
+    return map;
+}
 
 /// <summary>
 /// Builds a cross-module enum member map from all Stage-3 ASTs.

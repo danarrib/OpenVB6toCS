@@ -27,6 +27,11 @@ public sealed class CodeGenerator
     // Dictionary accessed as a member (TryGetSimpleType returns null for member-access chains).
     private readonly IReadOnlySet<string>? _dictionaryTypedFieldNames;
 
+    // Cross-module map: member name → C# type for all fields, properties, and UDT fields.
+    // Conflict-excluded (same name, different types across modules → excluded).
+    // Used by TryGetSimpleType to resolve MemberAccessNode types (e.g. obj.Val_IS → "double").
+    private readonly IReadOnlyDictionary<string, string>? _allMemberTypeMap;
+
     // Cross-module default member map: className → defaultMemberName (VB_UserMemId = 0).
     // Used to expand VB6 default member calls: obj(arg) → obj.DefaultMember(arg).
     private readonly IReadOnlyDictionary<string, string>? _defaultMemberMap;
@@ -70,7 +75,8 @@ public sealed class CodeGenerator
         IReadOnlyDictionary<string, string>? defaultMemberMap,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap,
         IReadOnlyDictionary<string, string>? globalVarMap,
-        IReadOnlySet<string>? dictionaryTypedFieldNames)
+        IReadOnlySet<string>? dictionaryTypedFieldNames,
+        IReadOnlyDictionary<string, string>? allMemberTypeMap)
     {
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
@@ -79,6 +85,7 @@ public sealed class CodeGenerator
         _methodParamMap = methodParamMap;
         _globalVarMap = globalVarMap;
         _dictionaryTypedFieldNames = dictionaryTypedFieldNames;
+        _allMemberTypeMap = allMemberTypeMap;
     }
 
     public static string Generate(ModuleNode module, bool isStaticModule,
@@ -87,9 +94,10 @@ public sealed class CodeGenerator
         IReadOnlyDictionary<string, string>? defaultMemberMap = null,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap = null,
         IReadOnlyDictionary<string, string>? globalVarMap = null,
-        IReadOnlySet<string>? dictionaryTypedFieldNames = null)
+        IReadOnlySet<string>? dictionaryTypedFieldNames = null,
+        IReadOnlyDictionary<string, string>? allMemberTypeMap = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -1509,6 +1517,11 @@ public sealed class CodeGenerator
         IdentifierNode id    => _procTypes.TryGetValue(id.Name, out var t) ? t
                               : _moduleFieldTypes.TryGetValue(id.Name, out t) ? t
                               : null,
+        // Member access: look up the member name in the cross-module field type map.
+        // This resolves types of UDT fields accessed as obj.FieldName when obj's type
+        // is not in scope (e.g. lstcCobert.Val_IS where lstcCobert is a UDT parameter).
+        MemberAccessNode m   => _allMemberTypeMap != null &&
+                                _allMemberTypeMap.TryGetValue(m.MemberName, out var mt) ? mt : null,
         _                    => null,
     };
 
