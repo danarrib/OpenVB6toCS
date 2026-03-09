@@ -608,6 +608,13 @@ public sealed class CodeGenerator
                 _w.OpenBrace();
                 foreach (var s in tc.CatchBody) GenerateStatement(s, returnType, resultVar);
                 _w.CloseBrace();
+                if (tc.FinallyBody is { Count: > 0 })
+                {
+                    _w.WriteLine("finally");
+                    _w.OpenBrace();
+                    foreach (var s in tc.FinallyBody) GenerateStatement(s, returnType, resultVar);
+                    _w.CloseBrace();
+                }
                 break;
 
             case OnErrorNode o:
@@ -1124,6 +1131,7 @@ public sealed class CodeGenerator
                 case TryCatchNode tc:
                     CollectLabelsInto(tc.TryBody, set);
                     CollectLabelsInto(tc.CatchBody, set);
+                    if (tc.FinallyBody != null) CollectLabelsInto(tc.FinallyBody, set);
                     break;
             }
         }
@@ -1226,7 +1234,9 @@ public sealed class CodeGenerator
                 WhileNode w      => [w.Body],
                 DoLoopNode d     => [d.Body],
                 WithNode w       => [w.Body],
-                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                TryCatchNode tc  => tc.FinallyBody != null
+                                    ? (IEnumerable<IReadOnlyList<AstNode>>)[tc.TryBody, tc.CatchBody, tc.FinallyBody]
+                                    : [tc.TryBody, tc.CatchBody],
                 _                => []
             };
             foreach (var child in children)
@@ -1266,7 +1276,9 @@ public sealed class CodeGenerator
                 WhileNode w      => [w.Body],
                 DoLoopNode d     => [d.Body],
                 WithNode w       => [w.Body],
-                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                TryCatchNode tc  => tc.FinallyBody != null
+                                    ? (IEnumerable<IReadOnlyList<AstNode>>)[tc.TryBody, tc.CatchBody, tc.FinallyBody]
+                                    : [tc.TryBody, tc.CatchBody],
                 _                => []
             };
             foreach (var child in children)
@@ -1470,7 +1482,9 @@ public sealed class CodeGenerator
                 WhileNode w      => [w.Body],
                 DoLoopNode d     => [d.Body],
                 WithNode w       => [w.Body],
-                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                TryCatchNode tc  => tc.FinallyBody != null
+                                    ? (IEnumerable<IReadOnlyList<AstNode>>)[tc.TryBody, tc.CatchBody, tc.FinallyBody]
+                                    : [tc.TryBody, tc.CatchBody],
                 _                => []
             };
             foreach (var child in children)
@@ -1503,7 +1517,9 @@ public sealed class CodeGenerator
                 WhileNode w      => [w.Body],
                 DoLoopNode d     => [d.Body],
                 WithNode w       => [w.Body],
-                TryCatchNode tc  => [tc.TryBody, tc.CatchBody],
+                TryCatchNode tc  => tc.FinallyBody != null
+                                    ? (IEnumerable<IReadOnlyList<AstNode>>)[tc.TryBody, tc.CatchBody, tc.FinallyBody]
+                                    : [tc.TryBody, tc.CatchBody],
                 _                => []
             };
             foreach (var child in children)

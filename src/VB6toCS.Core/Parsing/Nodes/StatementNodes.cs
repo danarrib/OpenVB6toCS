@@ -194,4 +194,5 @@ public sealed record TryCatchNode(
     int Column,
     IReadOnlyList<AstNode> TryBody,
     string CatchVariable,
-    IReadOnlyList<AstNode> CatchBody) : AstNode(Line, Column);
+    IReadOnlyList<AstNode> CatchBody,
+    IReadOnlyList<AstNode>? FinallyBody = null) : AstNode(Line, Column);

@@ -169,8 +169,9 @@ public sealed class Transformer
 
         TryCatchNode tc => tc with
         {
-            TryBody   = tc.TryBody.Select(TransformStatement).ToList(),
-            CatchBody = tc.CatchBody.Select(TransformStatement).ToList(),
+            TryBody     = tc.TryBody.Select(TransformStatement).ToList(),
+            CatchBody   = tc.CatchBody.Select(TransformStatement).ToList(),
+            FinallyBody = tc.FinallyBody?.Select(TransformStatement).ToList(),
         },
 
         _ => node,
@@ -181,95 +182,165 @@ public sealed class Transformer
     private IReadOnlyList<AstNode> TransformErrorHandling(
         IReadOnlyList<AstNode> body, string context, int contextLine)
     {
-        // On Error GoTo → try/catch restructuring is disabled.
-        // VB6 error handling semantics differ too much from C# try/catch to be mechanically
-        // reliable. OnErrorNode, ResumeNode, and LabelNode are left in the body so the code
-        // generator can emit them as comments for manual review.
-        return body;
+        // Try to detect the structured try/catch/finally pattern. If it matches all
+        // validation checks, return a clean TryCatchNode with no residual comments or
+        // labels. If anything fails, return the body untouched — the code generator
+        // will emit all error-related nodes as comments for manual review.
+        return TryDetectStructuredPattern(body) ?? body;
+    }
 
-        // Locate all "On Error GoTo label" nodes in the direct statement list.
-        int errorNodeIdx = -1;
-        int goToCount = 0;
-        string? label = null;
-        int errorLine = contextLine, errorCol = 1;
-
-        for (int i = 0; i < body.Count; i++)
+    /// <summary>
+    /// Attempts to detect the canonical VB6 try/catch/finally pattern:
+    /// <code>
+    ///   On Error GoTo ErrLabel
+    ///   [try body]
+    ///   CleanupLabel:
+    ///   [finally body]
+    ///   Exit Sub / Function / Property
+    ///   ErrLabel:
+    ///   [catch body]
+    ///   GoTo CleanupLabel
+    /// </code>
+    /// Returns a restructured body containing a clean <see cref="TryCatchNode"/> on success,
+    /// or <c>null</c> if any validation check fails (caller falls back to comment-out).
+    /// </summary>
+    private static IReadOnlyList<AstNode>? TryDetectStructuredPattern(IReadOnlyList<AstNode> body)
+    {
+        // ── 1. Exactly one "On Error GoTo <label>" in the flat top-level body ─────────
+        int onErrorIdx = -1;
+        string? errLabel = null;
+        foreach (var (node, i) in body.Select((n, i) => (n, i)))
         {
-            if (body[i] is OnErrorNode o && o.Kind == OnErrorKind.GoTo && o.LabelName != null)
+            if (node is OnErrorNode o && o.Kind == OnErrorKind.GoTo && o.LabelName != null)
             {
-                goToCount++;
-                if (goToCount == 1)
-                {
-                    errorNodeIdx = i;
-                    label        = o.LabelName;
-                    errorLine    = o.Line;
-                    errorCol     = o.Column;
-                }
+                if (onErrorIdx >= 0) return null; // more than one
+                onErrorIdx = i;
+                errLabel = o.LabelName;
             }
         }
+        if (onErrorIdx < 0) return null;
 
-        if (goToCount == 0)
-            return body; // nothing to transform
+        // ── 2. No Resume anywhere in the entire body (including nested) ──────────────
+        if (FindAllDeep<ResumeNode>(body).Any()) return null;
 
-        if (goToCount > 1)
-        {
-            Warn(context,
-                $"{goToCount} 'On Error GoTo' handlers — structural error-handling transform skipped; manual review required.",
-                contextLine, 1);
-            return body;
-        }
+        // ── 3. Find errLabel in the flat body (must come after On Error GoTo) ────────
+        int errIdx = FindLabelIdx(body, errLabel!);
+        if (errIdx < 0 || errIdx <= onErrorIdx) return null;
 
-        // Find the matching label node.
-        int labelIdx = -1;
-        for (int i = 0; i < body.Count; i++)
-        {
-            if (body[i] is LabelNode ln &&
-                ln.Name.Equals(label, StringComparison.OrdinalIgnoreCase))
-            {
-                labelIdx = i;
-                break;
-            }
-        }
+        // ── 4. Catch section validation ───────────────────────────────────────────────
+        var catchSection = body.Skip(errIdx + 1).ToList();
 
-        if (labelIdx < 0)
-        {
-            Warn(context,
-                $"label '{label}' referenced by 'On Error GoTo' not found in procedure body — transform skipped.",
-                errorLine, errorCol);
-            return body;
-        }
+        // 4a. Last meaningful statement must be a GoTo <cleanupLabel>
+        int lastMeaningful = LastMeaningfulIdx(catchSection);
+        if (lastMeaningful < 0) return null;
+        if (catchSection[lastMeaningful] is not GoToNode finalGoTo) return null;
+        string cleanupLabel = finalGoTo.Label;
 
-        // Split the body:
-        //   preamble  = [0 .. errorNodeIdx)
-        //   tryBody   = (errorNodeIdx .. labelIdx)
-        //   catchBody = (labelIdx .. end)
-        var preamble  = body.Take(errorNodeIdx).ToList();
-        var tryBody   = body.Skip(errorNodeIdx + 1).Take(labelIdx - errorNodeIdx - 1).ToList();
-        var catchBody = body.Skip(labelIdx + 1).ToList();
+        // 4b. No GoTo in catch section other than that final one (at any nesting depth)
+        if (FindAllDeep<GoToNode>(catchSection).Count() != 1) return null;
 
-        // Warn if there's no Exit Sub/Function before the label — the handler is reachable
-        // without an error in VB6 (fall-through), which differs from C# try/catch semantics.
-        bool hadExit = tryBody.OfType<ExitNode>()
-            .Any(e => e.What is "Sub" or "Function" or "Property");
+        // 4c. No nested On Error in catch section
+        if (FindAllDeep<OnErrorNode>(catchSection).Any()) return null;
 
-        if (!hadExit)
-        {
-            Warn(context,
-                $"error handler '{label}' may be reachable without an error (no Exit before label); review generated try/catch.",
-                body[labelIdx].Line, 1);
-        }
+        // ── 5. Find cleanupLabel (must appear before errLabel in the flat body) ───────
+        int cleanupIdx = FindLabelIdx(body, cleanupLabel);
+        if (cleanupIdx < 0 || cleanupIdx >= errIdx) return null;
 
-        // Remove trailing Exit Sub/Function from tryBody (it just guards fall-through).
-        tryBody = StripTrailingExit(tryBody);
+        // ── 6. Finally section validation (cleanupLabel+1 .. errLabel-1) ─────────────
+        var finallySection = body.Skip(cleanupIdx + 1).Take(errIdx - cleanupIdx - 1).ToList();
 
-        // Remove trailing Resume/Resume Next from catchBody.
-        catchBody = StripTrailingResume(catchBody, context);
+        // 6a. Must contain an Exit Sub / Function / Property
+        if (!finallySection.OfType<ExitNode>()
+                .Any(e => e.What is "Sub" or "Function" or "Property"))
+            return null;
+
+        // 6b. No GoTo or On Error in finally section (at any nesting depth)
+        if (FindAllDeep<GoToNode>(finallySection).Any()) return null;
+        if (FindAllDeep<OnErrorNode>(finallySection).Any()) return null;
+
+        // ── 7. Try section validation (On Error GoTo+1 .. cleanupLabel-1) ────────────
+        var trySection = body.Skip(onErrorIdx + 1).Take(cleanupIdx - onErrorIdx - 1).ToList();
+
+        // 7a. No GoTo that escapes to errLabel or cleanupLabel (at any nesting depth)
+        bool hasEscapeGoTo = FindAllDeep<GoToNode>(trySection).Any(g =>
+            g.Label.Equals(errLabel,     StringComparison.OrdinalIgnoreCase) ||
+            g.Label.Equals(cleanupLabel, StringComparison.OrdinalIgnoreCase));
+        if (hasEscapeGoTo) return null;
+
+        // 7b. No nested On Error in try section
+        if (FindAllDeep<OnErrorNode>(trySection).Any()) return null;
+
+        // ── All checks passed — build the clean try/catch/finally ─────────────────────
+        // Finally body: strip the trailing Exit (implicit in try/finally control flow)
+        var finallyBody = StripTrailingExit(finallySection);
+        // Catch body: strip the trailing GoTo (now represented by the finally clause)
+        var catchBody = catchSection.Take(lastMeaningful).ToList();
+        // Preamble: anything before On Error GoTo (typically variable declarations)
+        var preamble = body.Take(onErrorIdx).ToList();
 
         var tryCatch = new TryCatchNode(
-            body[errorNodeIdx].Line, body[errorNodeIdx].Column,
-            tryBody, "_ex", catchBody);
+            body[onErrorIdx].Line, body[onErrorIdx].Column,
+            trySection, "_ex", catchBody, finallyBody);
 
         return [.. preamble, tryCatch];
+    }
+
+    // ── Pattern-detection helpers ────────────────────────────────────────────
+
+    private static int FindLabelIdx(IReadOnlyList<AstNode> body, string labelName)
+    {
+        for (int i = 0; i < body.Count; i++)
+            if (body[i] is LabelNode l &&
+                l.Name.Equals(labelName, StringComparison.OrdinalIgnoreCase))
+                return i;
+        return -1;
+    }
+
+    private static int LastMeaningfulIdx(IReadOnlyList<AstNode> list)
+    {
+        for (int i = list.Count - 1; i >= 0; i--)
+            if (list[i] is not CommentNode) return i;
+        return -1;
+    }
+
+    /// <summary>
+    /// Recursively yields all nodes of type <typeparamref name="T"/> anywhere in the body,
+    /// including inside nested statement blocks (If, For, With, etc.).
+    /// </summary>
+    private static IEnumerable<T> FindAllDeep<T>(IReadOnlyList<AstNode> body) where T : AstNode
+    {
+        foreach (var node in body)
+        {
+            if (node is T t) yield return t;
+            foreach (var child in ChildBodies(node))
+                foreach (var found in FindAllDeep<T>(child))
+                    yield return found;
+        }
+    }
+
+    private static IEnumerable<IReadOnlyList<AstNode>> ChildBodies(AstNode node)
+    {
+        switch (node)
+        {
+            case IfNode i:
+                yield return i.ThenBody;
+                foreach (var ei in i.ElseIfClauses) yield return ei.Body;
+                if (i.ElseBody != null) yield return i.ElseBody;
+                break;
+            case SelectCaseNode s:
+                foreach (var c in s.Cases) yield return c.Body;
+                break;
+            case ForNextNode f:  yield return f.Body; break;
+            case ForEachNode fe: yield return fe.Body; break;
+            case WhileNode w:    yield return w.Body;  break;
+            case DoLoopNode d:   yield return d.Body;  break;
+            case WithNode w:     yield return w.Body;  break;
+            case TryCatchNode tc:
+                yield return tc.TryBody;
+                yield return tc.CatchBody;
+                if (tc.FinallyBody != null) yield return tc.FinallyBody;
+                break;
+        }
     }
 
     private static List<AstNode> StripTrailingExit(List<AstNode> body)
@@ -283,31 +354,6 @@ public sealed class Transformer
             var result = new List<AstNode>(body);
             result.RemoveAt(i);
             return result;
-        }
-
-        return body;
-    }
-
-    private List<AstNode> StripTrailingResume(List<AstNode> body, string context)
-    {
-        int i = body.Count - 1;
-        while (i >= 0 && body[i] is CommentNode) i--;
-
-        if (i >= 0 && body[i] is ResumeNode r)
-        {
-            if (r.IsNext)
-            {
-                // Resume Next: execution continues after the catch block — correct.
-                var result = new List<AstNode>(body);
-                result.RemoveAt(i);
-                return result;
-            }
-
-            // Resume / Resume label: no direct C# equivalent; leave in body + warn.
-            var resumeDesc = r.LabelName != null ? $"Resume {r.LabelName}" : "Resume";
-            Warn(context,
-                $"'{resumeDesc}' in error handler has no C# equivalent; manual review required.",
-                r.Line, r.Column);
         }
 
         return body;

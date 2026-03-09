@@ -223,6 +223,11 @@ public static class AstPrinter
                 PrintNodes(tc.TryBody, writer, indent + "    ");
                 writer.WriteLine($"{indent}  Catch ({tc.CatchVariable}):");
                 PrintNodes(tc.CatchBody, writer, indent + "    ");
+                if (tc.FinallyBody is { Count: > 0 })
+                {
+                    writer.WriteLine($"{indent}  Finally:");
+                    PrintNodes(tc.FinallyBody, writer, indent + "    ");
+                }
                 break;
 
             case ErrorStatementNode e:

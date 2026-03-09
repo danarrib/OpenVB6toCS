@@ -219,6 +219,53 @@ which is safer than generating silently wrong try/catch blocks.
 
 ---
 
+### ✅ 16. Structured error handling — `try/catch/finally` pattern detection
+
+A specific, common VB6 pattern maps cleanly and safely to `try/catch/finally`:
+
+```vb
+Function Foo
+    On Error GoTo ErrorHandler
+    ' ... work ...
+    LogSuccess
+ExitGracefully:
+    CloseConnections
+    Exit Function
+ErrorHandler:
+    LogError
+    GoTo ExitGracefully
+End Function
+```
+
+Maps to:
+```csharp
+void Foo()
+{
+    try { /* work */ LogSuccess(); }
+    catch { LogError(); }
+    finally { CloseConnections(); }
+}
+```
+
+**Detection algorithm (in `Transformer.cs`):**
+1. Procedure has exactly one `On Error GoTo errLabel`.
+2. Find `errLabel:` — its body ends with `GoTo cleanupLabel` (no other `GoTo`s in the error block).
+3. Find `cleanupLabel:` — its body ends with `Exit Function/Sub` (the normal-exit path).
+4. Everything before the first of these two labels is the `try` body.
+5. `cleanupLabel:` body (minus the `Exit`) → `finally` body.
+6. `errLabel:` body (minus the `GoTo cleanupLabel`) → `catch` body.
+7. Restructure into `TryCatchFinallyNode(TryBody, CatchBody, FinallyBody)`.
+
+**Reject and fall back to comment-out when:**
+- More than one `On Error GoTo` in the procedure
+- `Resume` or `Resume Next` appears anywhere
+- The error block has more than one `GoTo` (ambiguous flow)
+- `cleanupLabel` is not immediately followed by the `errLabel` (interleaved labels)
+
+**Status:** Pending
+
+---
+
 ### 11. `GoTo` outside error handlers
 
 Non-error-handler `GoTo` is emitted as `goto label;`. C# allows it but it's fragile with
@@ -290,6 +337,7 @@ or `DateTime.Parse("1/15/2020")` as a safer fallback.
 | 13 | Nested `With` stack | quality | Pending |
 | 14 | Numeric narrowing casts | quality | Pending |
 | 15 | `Date` literals | quality | Pending |
+| 16 | Structured `On Error GoTo` → `try/catch/finally` pattern | quality | ✅ Done |
 
 ## Additional fixes made during sprint (discovered while implementing 1–8)
 
