@@ -16,7 +16,7 @@ generated bare `label:` with no following statement.
 
 ---
 
-### 9. Cross-module nested enum type names (CS0246 — ~100 errors)
+### ✅ 9. Cross-module nested enum type names (CS0246 — ~100 errors)
 
 In the generated C#, all enums are **nested types** of their declaring class
 (e.g. `e_CodRamo` is defined inside `stcA46V702B`). When another class uses
@@ -39,7 +39,7 @@ type name itself in declarations, parameter types, and return types.
 
 ---
 
-### 10. VB6 built-in enum types as optional parameter defaults (CS1750 — 2 errors)
+### ✅ 10. VB6 built-in enum types as optional parameter defaults (CS1750 — 2 errors)
 
 Two functions use VB6/VBA built-in enum types as optional parameter types with
 integer defaults:
@@ -151,8 +151,8 @@ VB6 date literals (`#1/15/2020#`) are currently emitted as
 | # | Fix | Errors | Status |
 |---|-----|--------|--------|
 | 8 | Labels before closing brace → `label: ;` | 236 | ✅ Done |
-| 9 | Cross-module enum type qualification | ~100 | Pending |
-| 10 | VB6 built-in enum types as param defaults | 2 | Pending |
+| 9 | Cross-module enum type qualification | ~100 | ✅ Done |
+| 10 | VB6 built-in enum types as param defaults | 2 | ✅ Done |
 | 11 | Mixed optional parameter ordering | 2 | Pending |
 | — | ADODB / cross-project types | ~182 | Expected (not translator) |
 | 1 | `Err.Raise` → `throw` | quality | Pending |
