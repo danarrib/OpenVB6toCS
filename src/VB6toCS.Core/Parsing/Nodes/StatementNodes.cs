@@ -196,3 +196,9 @@ public sealed record TryCatchNode(
     string CatchVariable,
     IReadOnlyList<AstNode> CatchBody,
     IReadOnlyList<AstNode>? FinallyBody = null) : AstNode(Line, Column);
+
+/// <summary>
+/// Produced by Stage 4 when a <c>GoTo errorLabel</c> inside a try body is identified
+/// as an intentional error raise (equivalent to <c>throw new Exception();</c>).
+/// </summary>
+public sealed record ThrowNode(int Line, int Column) : AstNode(Line, Column);

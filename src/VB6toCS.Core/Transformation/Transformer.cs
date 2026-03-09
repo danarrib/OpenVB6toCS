@@ -261,11 +261,14 @@ public sealed class Transformer
         // ── 7. Try section validation (On Error GoTo+1 .. cleanupLabel-1) ────────────
         var trySection = body.Skip(onErrorIdx + 1).Take(cleanupIdx - onErrorIdx - 1).ToList();
 
-        // 7a. No GoTo that escapes to errLabel or cleanupLabel (at any nesting depth)
-        bool hasEscapeGoTo = FindAllDeep<GoToNode>(trySection).Any(g =>
-            g.Label.Equals(errLabel,     StringComparison.OrdinalIgnoreCase) ||
+        // 7a. No GoTo to cleanupLabel from try section (would bypass the error handler)
+        bool hasCleanupGoTo = FindAllDeep<GoToNode>(trySection).Any(g =>
             g.Label.Equals(cleanupLabel, StringComparison.OrdinalIgnoreCase));
-        if (hasEscapeGoTo) return null;
+        if (hasCleanupGoTo) return null;
+
+        // GoTo errLabel inside the try section is intentional: it means the code detected
+        // an error condition and wants to raise it. Replace those with ThrowNode.
+        var transformedTrySection = ReplaceGoToWithThrow(trySection, errLabel!);
 
         // 7b. No nested On Error in try section
         if (FindAllDeep<OnErrorNode>(trySection).Any()) return null;
@@ -280,7 +283,7 @@ public sealed class Transformer
 
         var tryCatch = new TryCatchNode(
             body[onErrorIdx].Line, body[onErrorIdx].Column,
-            trySection, "_ex", catchBody, finallyBody);
+            transformedTrySection, "_ex", catchBody, finallyBody);
 
         return [.. preamble, tryCatch];
     }
@@ -341,6 +344,53 @@ public sealed class Transformer
                 if (tc.FinallyBody != null) yield return tc.FinallyBody;
                 break;
         }
+    }
+
+    /// <summary>
+    /// Recursively replaces every <c>GoTo <paramref name="errLabel"/></c> node in the body
+    /// with a <see cref="ThrowNode"/>. Used to convert intentional error-raising jumps
+    /// inside a try body (e.g. <c>If failed Then GoTo ErrorHandler</c>) into proper throws.
+    /// </summary>
+    private static IReadOnlyList<AstNode> ReplaceGoToWithThrow(
+        IReadOnlyList<AstNode> body, string errLabel) =>
+        body.Select(n => ReplaceGoToNode(n, errLabel)).ToList();
+
+    private static AstNode ReplaceGoToNode(AstNode node, string errLabel)
+    {
+        if (node is GoToNode g &&
+            g.Label.Equals(errLabel, StringComparison.OrdinalIgnoreCase))
+            return new ThrowNode(g.Line, g.Column);
+
+        return node switch
+        {
+            IfNode i => i with
+            {
+                ThenBody      = ReplaceGoToWithThrow(i.ThenBody, errLabel),
+                ElseIfClauses = i.ElseIfClauses
+                    .Select(ei => ei with { Body = ReplaceGoToWithThrow(ei.Body, errLabel) })
+                    .ToList(),
+                ElseBody = i.ElseBody != null
+                    ? ReplaceGoToWithThrow(i.ElseBody, errLabel) : null,
+            },
+            SingleLineIfNode si => si with
+            {
+                ThenStatement = ReplaceGoToNode(si.ThenStatement, errLabel),
+                ElseStatement = si.ElseStatement != null
+                    ? ReplaceGoToNode(si.ElseStatement, errLabel) : null,
+            },
+            SelectCaseNode s => s with
+            {
+                Cases = s.Cases
+                    .Select(c => c with { Body = ReplaceGoToWithThrow(c.Body, errLabel) })
+                    .ToList(),
+            },
+            ForNextNode  f  => f  with { Body = ReplaceGoToWithThrow(f.Body,  errLabel) },
+            ForEachNode  fe => fe with { Body = ReplaceGoToWithThrow(fe.Body, errLabel) },
+            WhileNode    w  => w  with { Body = ReplaceGoToWithThrow(w.Body,  errLabel) },
+            DoLoopNode   d  => d  with { Body = ReplaceGoToWithThrow(d.Body,  errLabel) },
+            WithNode     w  => w  with { Body = ReplaceGoToWithThrow(w.Body,  errLabel) },
+            _               => node,
+        };
     }
 
     private static List<AstNode> StripTrailingExit(List<AstNode> body)

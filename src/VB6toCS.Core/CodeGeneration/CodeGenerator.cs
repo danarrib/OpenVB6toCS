@@ -617,6 +617,10 @@ public sealed class CodeGenerator
                 }
                 break;
 
+            case ThrowNode:
+                _w.WriteLine("throw new Exception();");
+                break;
+
             case OnErrorNode o:
                 switch (o.Kind)
                 {
