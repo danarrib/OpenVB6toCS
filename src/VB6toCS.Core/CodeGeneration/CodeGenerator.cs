@@ -965,6 +965,16 @@ public sealed class CodeGenerator
                 return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
         }
 
+        // Dictionary-typed Collection field indexed by integer: obj.DictField(i) → obj.DictField.ElementAt(i - 1).Value
+        // VB6 Collections are 1-based; .ElementAt() is 0-based, so subtract 1 to preserve semantics.
+        // Applies when the member name is known (from the cross-module set) to be a Dictionary-typed field.
+        if (c.Target is MemberAccessNode dictMa && c.Arguments.Count > 0 &&
+            _dictionaryTypedFieldNames != null &&
+            _dictionaryTypedFieldNames.Contains(dictMa.MemberName))
+        {
+            return $"{Expr(c.Target)}.ElementAt({Args(c.Arguments)} - 1).Value";
+        }
+
         // Array-typed / List<T> / Dictionary<string,T> variable access: col(i) → col[i] or col[i-1]
         // Applies when the target is a variable whose type is an array, List<T>, or Dictionary<string,T>.
         if (c.Arguments.Count > 0)
@@ -977,7 +987,7 @@ public sealed class CodeGenerator
                 if (targetType.StartsWith("List<", StringComparison.OrdinalIgnoreCase))
                     return $"{Expr(c.Target)}[{Args(c.Arguments)} - 1] /* 1-based */";
                 if (targetType.StartsWith("Dictionary<", StringComparison.OrdinalIgnoreCase))
-                    return $"{Expr(c.Target)}[{Args(c.Arguments)}]";
+                    return $"{Expr(c.Target)}.ElementAt({Args(c.Arguments)} - 1).Value /* 1-based */";
             }
         }
 
@@ -1702,6 +1712,18 @@ public sealed class CodeGenerator
                 left  = NumericToString(b.Left, left);
 
             // Fields("key") returns object — add explicit conversion based on the other operand's type.
+            if (IsFieldsCallNode(b.Left) && !IsFieldsCallNode(b.Right))
+                left  = WrapObjectConversion(left,  rightType ?? TryGetSimpleType(b.Right)) ?? left;
+            else if (IsFieldsCallNode(b.Right) && !IsFieldsCallNode(b.Left))
+                right = WrapObjectConversion(right, leftType  ?? TryGetSimpleType(b.Left))  ?? right;
+        }
+
+        // Fields("key") in arithmetic expressions also returns object — needs explicit conversion.
+        // (The comparison block above handles == / != / < etc.; this covers + - * / %.)
+        if (b.Operator is TokenKind.Plus or TokenKind.Minus or TokenKind.Star or TokenKind.Slash or TokenKind.KwMod)
+        {
+            string? leftType  = TryGetSimpleType(b.Left);
+            string? rightType = TryGetSimpleType(b.Right);
             if (IsFieldsCallNode(b.Left) && !IsFieldsCallNode(b.Right))
                 left  = WrapObjectConversion(left,  rightType ?? TryGetSimpleType(b.Right)) ?? left;
             else if (IsFieldsCallNode(b.Right) && !IsFieldsCallNode(b.Left))
