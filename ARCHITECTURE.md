@@ -3,6 +3,7 @@
 This document describes the full translation pipeline from VB6 source to C# output.
 
 ```mermaid
+%%{init: {"flowchart": {"htmlLabels": false}} }%%
 flowchart TD
     INPUT([".vbp / .cls / .bas\ninput file"]) --> DISPATCH
 
