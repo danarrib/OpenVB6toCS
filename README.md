@@ -2,6 +2,8 @@
 
 An open-source, free Visual Basic 6 to C# source code translator targeting **ActiveX DLLs** — business logic components with no UI.
 
+![logo](https://user-images.githubusercontent.com/17026744/79247080-68442000-7e50-11ea-9137-faeec5209107.png)
+
 ## Scope
 
 **Supported input:**
