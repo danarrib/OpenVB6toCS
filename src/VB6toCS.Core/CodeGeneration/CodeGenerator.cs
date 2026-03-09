@@ -684,7 +684,7 @@ public sealed class CodeGenerator
             case LabelNode l:
                 // Labels must be at the method body level; dedent by one for the label itself.
                 // C# identifiers cannot start with a digit — prefix numeric labels with _L.
-                _w.WriteLine($"{CsLabel(l.Name)}:");
+                _w.WriteLine($"{CsLabel(l.Name)}: ;"); // trailing ; = empty statement (label can't be last in a block)
                 break;
 
             case ErrorStatementNode e:
