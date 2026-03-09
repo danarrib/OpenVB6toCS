@@ -745,7 +745,7 @@ public sealed class CodeGenerator
         TypeOfIsNode t              => $"({Expr(t.Operand)} is {t.TypeName})",
 
         MemberAccessNode m          => $"{Expr(m.Object)}.{m.MemberName}",
-        BangAccessNode b            => $"{Expr(b.Object)}[\"{b.MemberName}\"] /* ! */",
+        BangAccessNode b            => BangAccess(b),
         WithMemberAccessNode w      => $"{CurrentWith()}.{w.MemberName}",
 
         IndexNode ix                => ix.Arguments.Count > 0
@@ -1544,8 +1544,50 @@ public sealed class CodeGenerator
     ///   <item>Default-member: <c>rst("key")</c> where rst's type has "Fields" as its default member.</item>
     /// </list>
     /// </summary>
+    /// <summary>
+    /// Emits VB6 bang-access (<c>obj!Member</c>).
+    /// If the object's type has a known default member (e.g. Fields), expands to
+    /// <c>obj.Fields(@"Member")</c> so that downstream Fields-conversion logic fires.
+    /// Falls back to <c>obj[@"Member"]</c> (verbatim string for safety) otherwise.
+    /// </summary>
+    private string BangAccess(BangAccessNode b)
+    {
+        string objExpr = Expr(b.Object);
+        // Determine the type of the object to look up its default member.
+        string? objType = b.Object switch
+        {
+            IdentifierNode id  => _procTypes.TryGetValue(id.Name, out var t1) ? t1
+                                : _moduleFieldTypes.TryGetValue(id.Name, out var t2) ? t2 : null,
+            MemberAccessNode m => _allMemberTypeMap != null &&
+                                  _allMemberTypeMap.TryGetValue(m.MemberName, out var mt) ? mt : null,
+            _                  => null,
+        };
+
+        if (objType != null && _defaultMemberMap != null &&
+            _defaultMemberMap.TryGetValue(objType, out var defMember))
+            return $"{objExpr}.{defMember}(@\"{b.MemberName}\") /* ! */";
+
+        return $"{objExpr}[@\"{b.MemberName}\"] /* ! */";
+    }
+
     private bool IsFieldsCallNode(ExpressionNode e)
     {
+        // BangAccessNode: rst!Key expands to rst.Fields("Key") when default member is Fields
+        if (e is BangAccessNode bang)
+        {
+            string? objType = bang.Object switch
+            {
+                IdentifierNode bid  => _procTypes.TryGetValue(bid.Name, out var bt1) ? bt1
+                                    : _moduleFieldTypes.TryGetValue(bid.Name, out var bt2) ? bt2 : null,
+                MemberAccessNode bm => _allMemberTypeMap != null &&
+                                      _allMemberTypeMap.TryGetValue(bm.MemberName, out var bmt) ? bmt : null,
+                _                  => null,
+            };
+            return objType != null && _defaultMemberMap != null &&
+                   _defaultMemberMap.TryGetValue(objType, out var defMember) &&
+                   defMember.Equals("Fields", StringComparison.OrdinalIgnoreCase);
+        }
+
         if (e is not CallOrIndexNode c || c.Arguments.Count == 0) return false;
 
         // Explicit rst.Fields("key")
