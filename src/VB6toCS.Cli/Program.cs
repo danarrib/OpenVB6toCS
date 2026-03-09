@@ -167,6 +167,10 @@ static int RunProject(string vbpPath, CliOptions options)
     // ── Cross-module method parameter map (used by code generator to emit ref at call sites) ───
     var methodParamMap = BuildMethodParamMap(stage3List.Select(r => r.Module));
 
+    // ── Cross-module method parameter TYPE map (built after Stage 4 for normalised types) ──────
+    // Built later (after parsed is populated). Declared here for scope.
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>> methodParamTypeMap;
+
     // ── Cross-module global variable map (public fields from all modules → declared type) ──────
     var globalVarMap = BuildGlobalVarMap(stage3List.Select(r => r.Module));
 
@@ -210,6 +214,9 @@ static int RunProject(string vbpPath, CliOptions options)
         return 0;
     }
 
+    // ── Method parameter TYPE map — built from Stage-4 normalised modules ───────────
+    methodParamTypeMap = BuildMethodParamTypeMap(parsed.Select(p => p.Module));
+
     // ── Cross-module member type map: fieldName → C# type (all fields + UDT fields) ──
     // Built from Stage-4 modules. Used to resolve member-access types like obj.Val_IS
     // when the receiver's declared type is unknown (cross-module UDT fields).
@@ -231,7 +238,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -389,6 +396,40 @@ static IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Par
                 case CsPropertyNode p when p.GetParameters.Count > 0:
                     inner[p.Name] = p.GetParameters.Select(pr => pr.Mode).ToArray();
                     break;
+            }
+        }
+        outer[module.Name] = inner;
+    }
+    return outer;
+}
+
+/// <summary>
+/// Builds a cross-module method parameter TYPE map from Stage-4 (normalised) ASTs.
+/// Maps module name → method name → ordered list of C# parameter type strings (null = unknown).
+/// Used by the code generator to coerce call-site arguments to the expected parameter types
+/// (e.g. double argument where int is expected → (int)arg; enum → (int)arg).
+/// </summary>
+static IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>
+    BuildMethodParamTypeMap(IEnumerable<ModuleNode> modules)
+{
+    var outer = new Dictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>(
+        StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        var inner = new Dictionary<string, IReadOnlyList<string?>>(StringComparer.OrdinalIgnoreCase);
+
+        IReadOnlyList<string?> ParamTypes(IReadOnlyList<ParameterNode> parms) =>
+            parms.Select(p => p.TypeRef?.TypeName).ToArray();
+
+        foreach (var member in module.Members)
+        {
+            switch (member)
+            {
+                case SubNode s:      inner[s.Name] = ParamTypes(s.Parameters); break;
+                case FunctionNode f: inner[f.Name] = ParamTypes(f.Parameters); break;
+                case CsPropertyNode p when p.GetParameters.Count > 0:
+                    inner[p.Name] = ParamTypes(p.GetParameters); break;
             }
         }
         outer[module.Name] = inner;

@@ -32,6 +32,11 @@ public sealed class CodeGenerator
     // Used by TryGetSimpleType to resolve MemberAccessNode types (e.g. obj.Val_IS → "double").
     private readonly IReadOnlyDictionary<string, string>? _allMemberTypeMap;
 
+    // Cross-module method parameter TYPE map: moduleName → (methodName → [csParamType, ...]).
+    // Built from Stage-4 normalised modules. Used by ArgsWithRef to coerce arguments to the
+    // declared parameter type at call sites (e.g. double → (int), enum → (int)).
+    private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>? _methodParamTypeMap;
+
     // Cross-module default member map: className → defaultMemberName (VB_UserMemId = 0).
     // Used to expand VB6 default member calls: obj(arg) → obj.DefaultMember(arg).
     private readonly IReadOnlyDictionary<string, string>? _defaultMemberMap;
@@ -76,7 +81,8 @@ public sealed class CodeGenerator
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap,
         IReadOnlyDictionary<string, string>? globalVarMap,
         IReadOnlySet<string>? dictionaryTypedFieldNames,
-        IReadOnlyDictionary<string, string>? allMemberTypeMap)
+        IReadOnlyDictionary<string, string>? allMemberTypeMap,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>? methodParamTypeMap)
     {
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
@@ -86,6 +92,7 @@ public sealed class CodeGenerator
         _globalVarMap = globalVarMap;
         _dictionaryTypedFieldNames = dictionaryTypedFieldNames;
         _allMemberTypeMap = allMemberTypeMap;
+        _methodParamTypeMap = methodParamTypeMap;
     }
 
     public static string Generate(ModuleNode module, bool isStaticModule,
@@ -95,9 +102,10 @@ public sealed class CodeGenerator
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap = null,
         IReadOnlyDictionary<string, string>? globalVarMap = null,
         IReadOnlySet<string>? dictionaryTypedFieldNames = null,
-        IReadOnlyDictionary<string, string>? allMemberTypeMap = null)
+        IReadOnlyDictionary<string, string>? allMemberTypeMap = null,
+        IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>? methodParamTypeMap = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -465,7 +473,7 @@ public sealed class CodeGenerator
                 // don't add another pair. Otherwise always emit "()" — even when ExplicitCall
                 // is false (VB6 Sub calls without the Call keyword omit parens, but C# requires them).
                 string callArgs   = c.Arguments.Count > 0
-                    ? "(" + ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target)) + ")"
+                    ? "(" + ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target), TryResolveProcParamTypes(c.Target)) + ")"
                     : c.Target is not CallOrIndexNode ? "()" : "";
                 // Detect Err.Raise → throw
                 if (callTarget == "Err.Raise")
@@ -1002,7 +1010,7 @@ public sealed class CodeGenerator
         // General call
         string target = Expr(c.Target);
         string args   = c.Arguments.Count > 0
-            ? $"({ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target))})"
+            ? $"({ArgsWithRef(c.Arguments, TryResolveProcParamModes(c.Target), TryResolveProcParamTypes(c.Target))})"
             : "()";
         return $"{target}{args}";
     }
@@ -1714,6 +1722,11 @@ public sealed class CodeGenerator
             if (IsEnumMember(b.Left)  && !IsEnumTypedField(b.Right)) left  = $"(int){left}";
             if (IsEnumMember(b.Right) && !IsEnumTypedField(b.Left))  right = $"(int){right}";
 
+            // Also cast enum-typed FIELDS when compared to a non-enum value.
+            // e.g. lStcPed.Cod_Ramo == 113 → (int)lStcPed.Cod_Ramo == 113.
+            if (IsEnumTypedField(b.Left)  && !IsEnumTypedField(b.Right) && !IsEnumMember(b.Right)) left  = $"(int){left}";
+            if (IsEnumTypedField(b.Right) && !IsEnumTypedField(b.Left)  && !IsEnumMember(b.Left))  right = $"(int){right}";
+
             // VB6 also coerces between string and numeric types implicitly.
             // In C# this is a compile error; convert the numeric side to string
             // (safer than parsing the string, which may throw on non-numeric values).
@@ -1874,9 +1887,10 @@ public sealed class CodeGenerator
     /// parameter is declared ByRef, using the supplied mode list.
     /// </summary>
     private string ArgsWithRef(IReadOnlyList<ArgumentNode> args,
-        IReadOnlyList<Parsing.Nodes.ParameterMode>? modes)
+        IReadOnlyList<Parsing.Nodes.ParameterMode>? modes,
+        IReadOnlyList<string?>? paramTypes = null)
     {
-        if (modes == null) return Args(args);
+        if (modes == null && paramTypes == null) return Args(args);
 
         // Trailing missing args can simply be omitted (C# optional params allow this).
         int last = args.Count - 1;
@@ -1888,7 +1902,13 @@ public sealed class CodeGenerator
             var a = args[i];
             if (a.IsMissing) { parts.Add("default /* missing optional */"); continue; }
             string expr = a.Name != null ? $"/* {a.Name}: */ {Expr(a.Value!)}" : Expr(a.Value!);
-            bool isByRef = i < modes.Count && modes[i] == Parsing.Nodes.ParameterMode.ByRef;
+
+            // Type coercion: cast argument to match the declared parameter type where needed.
+            string? expectedType = (paramTypes != null && i < paramTypes.Count) ? paramTypes[i] : null;
+            if (expectedType != null && a.Value != null)
+                expr = CoerceArgToParamType(expr, a.Value, expectedType);
+
+            bool isByRef = modes != null && i < modes.Count && modes[i] == Parsing.Nodes.ParameterMode.ByRef;
             if (isByRef)
             {
                 // C# forbids `ref` on a literal — drop the modifier and flag for review.
@@ -1905,10 +1925,91 @@ public sealed class CodeGenerator
     }
 
     /// <summary>
+    /// Coerces a call-site argument expression to match the declared parameter type,
+    /// inserting an explicit cast or Convert.To*() when the types are incompatible in C#.
+    /// Only acts when a mismatch is detectable; passes through unchanged otherwise.
+    /// </summary>
+    private string CoerceArgToParamType(string expr, ExpressionNode argNode, string expectedType)
+    {
+        if (expectedType == "object") return expr; // any argument is valid for object
+
+        string? actualType = TryGetSimpleType(argNode);
+        bool actualIsEnum  = IsEnumTypedField(argNode) || IsEnumMember(argNode);
+
+        switch (expectedType)
+        {
+            case "int":
+                // enum-typed field or enum member → (int)
+                if (actualIsEnum)   return $"(int){expr}";
+                // wider numeric → narrowing cast
+                if (actualType is "double" or "float" or "decimal" or "long")
+                    return $"(int){expr}";
+                // object (e.g. Fields("key")) → Convert.ToInt32
+                if (IsFieldsCallNode(argNode)) return $"Convert.ToInt32({expr})";
+                break;
+
+            case "double":
+                if (IsFieldsCallNode(argNode)) return $"Convert.ToDouble({expr})";
+                // int/bool → implicit widening in C#, no cast needed
+                break;
+
+            case "string":
+                if (IsFieldsCallNode(argNode))            return $"Convert.ToString({expr})";
+                if (IsNumericCsType(actualType))          return $"{expr}.ToString()";
+                break;
+
+            case "bool":
+                if (IsFieldsCallNode(argNode))            return $"Convert.ToBoolean({expr})";
+                break;
+        }
+
+        return expr;
+    }
+
+    /// <summary>
     /// Tries to resolve the parameter mode list for a call target by looking up the
     /// method name and (optionally) the qualifying module name in _methodParamMap.
     /// Returns null when the target cannot be resolved or the map is absent.
     /// </summary>
+    /// <summary>Tries to resolve the parameter type list for a call target from _methodParamTypeMap.</summary>
+    private IReadOnlyList<string?>? TryResolveProcParamTypes(ExpressionNode target)
+    {
+        if (_methodParamTypeMap == null) return null;
+
+        if (target is IdentifierNode id)
+        {
+            if (_methodParamTypeMap.TryGetValue(_currentModuleName, out var selfMethods) &&
+                selfMethods.TryGetValue(id.Name, out var types0))
+                return types0;
+            foreach (var module in _methodParamTypeMap.Values)
+                if (module.TryGetValue(id.Name, out var types1))
+                    return types1;
+            return null;
+        }
+
+        if (target is MemberAccessNode ma)
+        {
+            string qualifier = ma.Object is IdentifierNode qid ? qid.Name : Expr(ma.Object);
+            if (_methodParamTypeMap.TryGetValue(qualifier, out var methods1) &&
+                methods1.TryGetValue(ma.MemberName, out var types2))
+                return types2;
+
+            if (ma.Object is IdentifierNode varId)
+            {
+                string? varType = _procTypes.TryGetValue(varId.Name, out var t1) ? t1
+                                : _moduleFieldTypes.TryGetValue(varId.Name, out var t2) ? t2
+                                : (_globalVarMap != null && _globalVarMap.TryGetValue(varId.Name, out var t3)) ? t3
+                                : null;
+                if (varType != null &&
+                    _methodParamTypeMap.TryGetValue(varType, out var methods2) &&
+                    methods2.TryGetValue(ma.MemberName, out var types3))
+                    return types3;
+            }
+        }
+
+        return null;
+    }
+
     private IReadOnlyList<Parsing.Nodes.ParameterMode>? TryResolveProcParamModes(ExpressionNode target)
     {
         if (_methodParamMap == null) return null;
