@@ -187,6 +187,10 @@ static int RunProject(string vbpPath, CliOptions options)
     // ── Cross-module enum member map (used by code generator for qualification) ─
     var enumMemberMap = BuildEnumMemberMap(stage3List.Select(r => r.Module));
 
+    // ── Cross-module enum TYPE map: enumTypeName → moduleName ────────────────
+    // Used to qualify cross-module enum type names in declarations (CS0246 fix).
+    var enumTypeMap = BuildEnumTypeMap(stage3List.Select(r => r.Module));
+
     // ── Set of field names whose declared type is an enum (suppresses int cast) ─
     var enumTypedFieldNames = BuildEnumTypedFieldNames(stage3List.Select(r => r.Module), enumMemberMap);
 
@@ -238,7 +242,7 @@ static int RunProject(string vbpPath, CliOptions options)
     foreach (var (src, module) in parsed)
     {
         bool isStatic = src.Kind == VbSourceKind.StaticModule;
-        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
+        string csCode = CodeGenerator.Generate(module, isStatic, enumMemberMap, enumTypedFieldNames, enumTypeMap, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
         string csFile = Path.Combine(outputDir, module.Name + ".cs");
         File.WriteAllText(csFile, csCode, System.Text.Encoding.UTF8);
         Console.WriteLine($"Written  : {module.Name}.cs");
@@ -654,6 +658,36 @@ static IReadOnlyDictionary<string, (string ModuleName, string EnumName)>
                     if (!map[em.Name].Item1.Equals(module.Name, StringComparison.OrdinalIgnoreCase))
                         conflicts.Add(em.Name);
                 }
+            }
+        }
+    }
+
+    foreach (var name in conflicts)
+        map.Remove(name);
+
+    return map;
+}
+
+/// <summary>
+/// Builds a cross-module map from enum type name → the module that defines it.
+/// Used by the code generator to qualify cross-module enum type references in
+/// field/parameter/return-type declarations (e.g. e_CodRamo → stcA46V702B.e_CodRamo).
+/// Enum names that appear in more than one module are excluded (ambiguous).
+/// </summary>
+static IReadOnlyDictionary<string, string> BuildEnumTypeMap(IEnumerable<ModuleNode> modules)
+{
+    var map       = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    var conflicts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var module in modules)
+    {
+        foreach (var member in module.Members)
+        {
+            if (member is not EnumNode e) continue;
+            if (!map.TryAdd(e.Name, module.Name))
+            {
+                if (!map[e.Name].Equals(module.Name, StringComparison.OrdinalIgnoreCase))
+                    conflicts.Add(e.Name);
             }
         }
     }

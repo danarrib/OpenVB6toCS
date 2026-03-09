@@ -37,6 +37,10 @@ public sealed class CodeGenerator
     // declared parameter type at call sites (e.g. double → (int), enum → (int)).
     private readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>? _methodParamTypeMap;
 
+    // Cross-module enum type map: enumTypeName → moduleName (the module where the enum is defined).
+    // Used in TypeStr() to qualify cross-module enum type names (e.g. e_CodRamo → stcA46V702B.e_CodRamo).
+    private readonly IReadOnlyDictionary<string, string>? _enumTypeMap;
+
     // Cross-module default member map: className → defaultMemberName (VB_UserMemId = 0).
     // Used to expand VB6 default member calls: obj(arg) → obj.DefaultMember(arg).
     private readonly IReadOnlyDictionary<string, string>? _defaultMemberMap;
@@ -77,6 +81,7 @@ public sealed class CodeGenerator
     private CodeGenerator(bool isStatic,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap,
         IReadOnlySet<string>? enumTypedFieldNames,
+        IReadOnlyDictionary<string, string>? enumTypeMap,
         IReadOnlyDictionary<string, string>? defaultMemberMap,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap,
         IReadOnlyDictionary<string, string>? globalVarMap,
@@ -87,6 +92,7 @@ public sealed class CodeGenerator
         _isStatic = isStatic;
         _enumMemberMap = enumMemberMap;
         _enumTypedFieldNames = enumTypedFieldNames;
+        _enumTypeMap = enumTypeMap;
         _defaultMemberMap = defaultMemberMap;
         _methodParamMap = methodParamMap;
         _globalVarMap = globalVarMap;
@@ -98,6 +104,7 @@ public sealed class CodeGenerator
     public static string Generate(ModuleNode module, bool isStaticModule,
         IReadOnlyDictionary<string, (string ModuleName, string EnumName)>? enumMemberMap = null,
         IReadOnlySet<string>? enumTypedFieldNames = null,
+        IReadOnlyDictionary<string, string>? enumTypeMap = null,
         IReadOnlyDictionary<string, string>? defaultMemberMap = null,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<Parsing.Nodes.ParameterMode>>>? methodParamMap = null,
         IReadOnlyDictionary<string, string>? globalVarMap = null,
@@ -105,7 +112,7 @@ public sealed class CodeGenerator
         IReadOnlyDictionary<string, string>? allMemberTypeMap = null,
         IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string?>>>? methodParamTypeMap = null)
     {
-        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
+        var gen = new CodeGenerator(isStaticModule, enumMemberMap, enumTypedFieldNames, enumTypeMap, defaultMemberMap, methodParamMap, globalVarMap, dictionaryTypedFieldNames, allMemberTypeMap, methodParamTypeMap);
         gen.GenerateModule(module);
 
         string classCode = gen._w.ToString();
@@ -2125,6 +2132,14 @@ public sealed class CodeGenerator
             _requiredUsings.Add("System.Collections.ObjectModel");
         if (name.StartsWith("Dictionary<") || name.StartsWith("List<"))
             _requiredUsings.Add("System.Collections.Generic");
+
+        // Qualify cross-module enum type names: e_CodRamo → stcA46V702B.e_CodRamo
+        if (_enumTypeMap != null &&
+            _enumTypeMap.TryGetValue(name, out var definingModule) &&
+            !definingModule.Equals(_currentModuleName, StringComparison.OrdinalIgnoreCase))
+        {
+            name = $"{definingModule}.{name}";
+        }
 
         // Arrays
         if (t.IsArray)

@@ -58,6 +58,13 @@ public sealed class Transformer
             ["Object"]     = "object",
             // Scripting.Dictionary used unqualified → generic Dictionary
             ["Dictionary"] = "Dictionary<string, object>",
+            // VB6/VBA intrinsic enum types — no .NET equivalent; downgrade to int
+            // so optional parameter default values compile (CS1750 fix).
+            ["VbMsgBoxStyle"]   = "int",
+            ["VbCompareMethod"] = "int",
+            ["VbTriState"]      = "int",
+            ["VbStrConv"]       = "int",
+            ["VbFileAttribute"] = "int",
         };
 
     public ModuleNode Transform(ModuleNode module)
