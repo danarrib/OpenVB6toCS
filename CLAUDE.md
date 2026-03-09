@@ -125,7 +125,7 @@ src/
       CollectionTypeInferrer.cs ← cross-module Collection<T> element type inference
     Transformation/
       TransformDiagnostic.cs
-      Transformer.cs      ← type normalization (Stage 4); error handling restructuring disabled
+      Transformer.cs      ← type normalization + structured error handling (Stage 4)
     CodeGeneration/
       CodeWriter.cs       ← indentation-aware line writer
       BuiltInMap.cs       ← VB6 built-in functions/constants → C# mapping table
@@ -162,43 +162,33 @@ CLAUDE.md                 ← this file
   (3) group `Property Get/Let/Set` into `CsPropertyNode`.
   Validated against `D46O003_1080.vbp`: all 137 files pass Stage 3 with 0 diagnostics.
 - **Stage 4 (IR Transformation): complete.** `Transformer.cs` in `VB6toCS.Core/Transformation/`.
-  Single pass: type normalization (VB6 type names → C# types in all TypeRefNodes).
-  Error handling restructuring (`On Error GoTo` → `TryCatchNode`) has been **disabled** — VB6
-  error handling semantics differ too much from C# try/catch to be mechanically reliable.
-  `OnErrorNode`, `ResumeNode`, and error-handler `LabelNode`s are left in the body so the code
-  generator emits them as comments for manual developer review.
+  Pass 1: type normalization (VB6 type names → C# types in all TypeRefNodes, including VB6/VBA
+  intrinsic enum types like `VbMsgBoxStyle` → `int`).
+  Pass 2: structured error handling detection. Validates the canonical VB6 pattern
+  (`On Error GoTo errLabel` / try body / cleanup label / finally body / error label / catch body /
+  `GoTo cleanupLabel`) against a strict checklist; on success emits a clean `TryCatchNode` with
+  no residual labels or comments. Falls back to leaving all error nodes intact (code generator
+  emits them as `// VB6:` comments) when any check fails.
+  `GoTo errLabel` inside the try body is replaced with `ThrowNode` → `throw new Exception();`.
   Validated against `D46O003_1080.vbp`: all 137 files pass Stage 4.
 - **Stage 5 (C# Code Generation): complete.** `CodeGenerator.cs` + `BuiltInMap.cs` + `ComTypeMap.cs` in `VB6toCS.Core/CodeGeneration/`.
-  Full C# output for all VB6 constructs. Five cross-module maps built in `Program.cs` between
-  Stages 4 and 5: `collectionTypeMap`, `enumMemberMap`, `enumTypedFieldNames`, `methodParamMap`, `globalVarMap`.
-  Validated against `D46O003_1080.vbp`: all 137 files translated, `.cs` files written.
-  Post-release enhancements applied (all validated against D46O003_1080.vbp):
-  - `ref` keyword emission at call sites for `ByRef` parameters (cross-module `methodParamMap`).
+  Full C# output for all VB6 constructs. Seven cross-module maps built in `Program.cs` between
+  Stages 4 and 5: `collectionTypeMap`, `enumMemberMap`, `enumTypeMap`, `enumTypedFieldNames`,
+  `methodParamMap`, `globalVarMap`, `dictionaryTypedFieldNames`, `allMemberTypeMap`, `methodParamTypeMap`.
+  All validated against D46O003_1080.vbp. Key capabilities:
+  - `ref` keyword at call sites for `ByRef` parameters (cross-module `methodParamMap`).
   - COM indexed-member disambiguation: `pRs.Fields(i)` → `pRs.Fields[i]` via `ComTypeMap`.
-  - Type-aware string coercion for `Left`/`Right`/`Mid`/`InStr`/`Len` (`.ToString()` on non-string args).
-  - VB6 date arithmetic: `Date - 60` → `DateTime.Now.Date.AddDays(-60)`.
-  - `IsMissing(x)` → `(x == null)` or `(x == default)` based on parameter type.
-  - `ReDim arr(n) As T` → `arr = new T[n]` (dimension expression now captured by parser).
-  - Function return-type inference: functions declared `As Variant` (→ `object`) whose body
-    consistently returns a single known type are emitted with that inferred type instead.
-  - `CollectionTypeInferrer` extended to infer element types through local `Collection`
-    intermediates (e.g. `registros` correctly typed as `Collection<Collection<clsYasField>>`).
-  Post-compilation-error sprint (items 1–8 from TODO.md, all validated against D46O003_1080.vbp):
-  - All string literals now emitted as `@"..."` verbatim strings — fixes `""` escape sequences
-    and backslash handling simultaneously. ~1,110 errors eliminated.
-  - Missing optional args: trailing args omitted; middle args → `default /* missing optional */`.
-  - VB6 `Static` locals: `static` keyword removed (illegal in method bodies), comment added.
-  - `ref` on literals dropped (C# forbids it); `/* was ByRef */` comment added.
-  - `IndexNode` with 0 arguments now emits target only (no empty `[]`).
-  - Lexer: type-suffix characters (`%&!#@$`) consumed but NOT appended for identifiers and
-    number literals. Hex format: `&H1F` → `0x1F`.
-  - Additional fixes: numeric labels (`10:` → `_L10:`), `Imp` operator (`(!a || b)`),
-    `DateAdd`/`DateDiff`/`Choose`/`Switch` → `default /* TODO */`, nested `/* */` in block
-    comments fixed, VB6 `Or` in case patterns split into two labels, `Collection` in function
-    return types now resolved, `static const` → `const`, `const object` type inferred from
-    literal, missing VB6 constants added, `ByRef` optional param defaults stripped,
-    unqualified `Dictionary` type → `Dictionary<string, object>`.
-  Result: ~2,500 errors → ~290, of which ~286 are expected (COM/cross-project dependencies).
+  - `Fields("key")` and bang-access (`rs!Key`) wrapped with `Convert.To*()` in typed contexts.
+  - `BangAccessNode` expanded via `_defaultMemberMap`: `rs!Key` → `rs.Fields(@"Key")`.
+  - `For Each` over `Dictionary` fields: `.Values` appended automatically.
+  - Dictionary integer index: `.ElementAt(i-1).Value` (1-based VB6 → 0-based C#).
+  - Cross-module enum type qualification: `e_CodRamo` → `stcA46V702B.e_CodRamo` in TypeStr().
+  - Function return-type inference: `Variant`-declared functions inferred to specific type.
+  - `CollectionTypeInferrer` resolves nested Collection element types cross-module.
+  - All string literals as `@"..."` verbatim (fixes `""` quoting and backslash handling).
+  - Labels emitted as `label: ;` (empty statement) — required when label is last in a block.
+  Integration build result: **zero genuine translator errors** in D46O003_1080 build.
+  All remaining build failures are expected COM/cross-project assembly reference absences.
 - **Stage 6 (Roslyn formatting): not yet implemented.**
 
 ## How to run
