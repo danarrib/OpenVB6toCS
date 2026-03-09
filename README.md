@@ -207,6 +207,8 @@ public stcConfig.e_CodRamo Cod_Ramo;
 
 ## Architecture
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a full Mermaid flowchart of the translation pipeline, including all decision branches for error handling, COM references, expression types, and code generation cases.
+
 ```
 VB6toCS.sln
 src/
